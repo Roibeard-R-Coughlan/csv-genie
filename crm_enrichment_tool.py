@@ -41,6 +41,18 @@ import re
 import time
 import argparse
 import os
+
+try:
+    # Attempt to load environment variables from a .env file if present.
+    # The python-dotenv package is not part of the standard library but is
+    # widely used.  If it's not installed, this import will fail silently
+    # and the script will only rely on environment variables already set.
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    # If dotenv is not available, ignore.  Users can set their environment
+    # variables via shell or PowerShell commands instead.
+    pass
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 
@@ -340,7 +352,7 @@ def enrich_record(record: CompanyRecord, delay: float = 0.0) -> CompanyRecord:
     )
 
 
-def enrich_csv(input_file: str, output_file: str, delay: float = 0.0) -> None:
+def enrich_csv(input_file: str, output_file: str, delay: float = 0.0, max_rows: Optional[int] = None) -> None:
     """
     Read a CSV file, enrich missing contact information, and write the
     results to a new CSV file.  The CSV should contain at least the
@@ -357,6 +369,10 @@ def enrich_csv(input_file: str, output_file: str, delay: float = 0.0) -> None:
     """
     df = pd.read_csv(input_file)
     updated_records = []
+    # Limit processing to the first `max_rows` if specified.  This
+    # helps preserve API credits during testing.
+    if max_rows is not None:
+        df = df.head(max_rows)
     for _, row in df.iterrows():
         company = CompanyRecord(
             name=str(row.get("Company Name", "")),
@@ -386,8 +402,9 @@ def main():
     parser.add_argument("--input-file", required=True, help="Path to input CRM CSV file")
     parser.add_argument("--output-file", required=True, help="Path to output enriched CSV file")
     parser.add_argument("--delay", type=float, default=0.0, help="Optional delay between network requests (seconds)")
+    parser.add_argument("--limit", type=int, default=None, help="Only process the first N rows to conserve API credits during testing")
     args = parser.parse_args()
-    enrich_csv(args.input_file, args.output_file, delay=args.delay)
+    enrich_csv(args.input_file, args.output_file, delay=args.delay, max_rows=args.limit)
 
 
 if __name__ == "__main__":
