@@ -248,7 +248,7 @@ class CompanyRecord:
     website: Optional[str]
 
 
-def enrich_record(record: CompanyRecord, delay: float = 0.0) -> CompanyRecord:
+def enrich_record(record: CompanyRecord, delay: float = 0.0, skip_apollo: bool = False) -> CompanyRecord:
     """
     Enrich a single company record by searching for website and email
     information if missing.  Returns an updated CompanyRecord.
@@ -297,12 +297,12 @@ def enrich_record(record: CompanyRecord, delay: float = 0.0) -> CompanyRecord:
     if record.website and record.email:
         return record
 
-    # Phase 1: Attempt to use Apollo API for missing website.
+    # Phase 1: Attempt to use Apollo API for missing website unless skipping.
     website_url: Optional[str] = record.website
     # Only attempt to enrich via Apollo if the website is missing and
     # an API key is provided via environment.
     apollo_api_key = os.getenv(APOLLO_API_KEY_ENV)
-    if not website_url and apollo_api_key:
+    if not skip_apollo and not website_url and apollo_api_key:
         try:
             enriched_data = apollo_organization_enrich(
                 company_name=record.name,
@@ -352,7 +352,7 @@ def enrich_record(record: CompanyRecord, delay: float = 0.0) -> CompanyRecord:
     )
 
 
-def enrich_csv(input_file: str, output_file: str, delay: float = 0.0, max_rows: Optional[int] = None) -> None:
+def enrich_csv(input_file: str, output_file: str, delay: float = 0.0, max_rows: Optional[int] = None, skip_apollo: bool = False) -> None:
     """
     Read a CSV file, enrich missing contact information, and write the
     results to a new CSV file.  The CSV should contain at least the
@@ -383,7 +383,7 @@ def enrich_csv(input_file: str, output_file: str, delay: float = 0.0, max_rows: 
         )
         # Only enrich rows missing either email or website.
         if not company.email or not company.website:
-            enriched = enrich_record(company, delay=delay)
+            enriched = enrich_record(company, delay=delay, skip_apollo=skip_apollo)
         else:
             enriched = company
         # Update DataFrame row.
@@ -403,8 +403,19 @@ def main():
     parser.add_argument("--output-file", required=True, help="Path to output enriched CSV file")
     parser.add_argument("--delay", type=float, default=0.0, help="Optional delay between network requests (seconds)")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N rows to conserve API credits during testing")
+    parser.add_argument(
+        "--skip-apollo",
+        action="store_true",
+        help="Do not call the Apollo API even if an API key is set. Useful to conserve credits or when Apollo is not needed",
+    )
     args = parser.parse_args()
-    enrich_csv(args.input_file, args.output_file, delay=args.delay, max_rows=args.limit)
+    enrich_csv(
+        args.input_file,
+        args.output_file,
+        delay=args.delay,
+        max_rows=args.limit,
+        skip_apollo=args.skip_apollo,
+    )
 
 
 if __name__ == "__main__":
