@@ -1,17 +1,16 @@
 # CSV Genie
 
-CSV Genie is a local Streamlit app for safely researching and enriching CRM import CSV files.
+CSV Genie is a local Streamlit tool for safely researching missing Website, Phone and Email values in CRM import CSV files.
 
-## What it does
+## Safety rules
 
-- Preserves existing CRM data.
-- Researches missing Website, Phone and optionally Email fields.
-- Shows proposed values with confidence and source URLs.
-- Exports an audit CSV and a CRM import CSV.
-- Keeps all original rows even when you only research a small test limit.
-- Apollo is optional and disabled by default to protect credits.
+- Existing CRM values are never overwritten.
+- Preview mode never changes CRM import fields.
+- Verified-only mode fills only blank fields that meet the confidence threshold.
+- Candidate Review shows possible matches for manual checking, even when they are not verified enough to auto-fill.
+- Apollo is disabled by default to avoid accidental API credit usage.
 
-## Setup
+## Run locally
 
 ```powershell
 cd C:\github-repo\csv-genie
@@ -19,27 +18,43 @@ python -m pip install -r requirements.txt
 python -m streamlit run streamlit_app.py
 ```
 
-## Optional Apollo key
+## Recommended test settings
 
-Create a `.env` file in the project folder:
+Use these first:
 
-```text
-APOLLO_API_KEY=your_new_key_here
-```
+- Run mode: `Preview only - do not change CRM fields`
+- Rows to research: `10`
+- Apollo: Off
+- Fields: Website + Phone
+- Candidate Review: On
 
-Do not commit `.env` to GitHub. It is included in `.gitignore`.
+## Which file to download
 
-## Recommended first test
+In Preview mode, download:
 
-1. Run mode: Preview only.
-2. Rows to research: 5.
-3. Apollo: Off.
-4. Fields: Website + Phone only.
-5. Review the audit table before downloading/importing anything.
+- `Download audit CSV for review - not for CRM import`
 
-## CLI example
+Do not import the Preview CRM file into the website because it is intentionally unchanged.
 
-```powershell
-python crm_enrichment_tool.py --input-file leads.csv --output-file audit.csv --limit 5 --mode preview
-python crm_enrichment_tool.py --input-file leads.csv --output-file verified.csv --limit 20 --mode verified_only --min-confidence 0.8
-```
+When the audit CSV shows good verified proposals, rerun with:
+
+- `Verified-only export - fill high-confidence blanks`
+
+Then download:
+
+- `Download CRM import CSV for website import`
+
+Still review the audit file before uploading anything to the CRM website.
+
+## v3 Candidate Review Improvement
+
+This version adds a direct-domain fallback for Candidate Review Mode. If search results do not return usable candidates, CSV Genie now checks likely official domains such as `companyname.ie`, `companyname.com`, `companyphysio.ie`, and similar conservative variants. Values are still written to audit/proposal columns first; Preview mode does not change CRM import fields.
+
+Recommended test settings:
+- Preview only
+- Rows to research: 10
+- Apollo off
+- Website only first
+- Then Website + Phone
+- Show candidate match columns on
+

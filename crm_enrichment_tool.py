@@ -1,4 +1,4 @@
-﻿"""
+"""
 CSV Genie - verified CRM enrichment engine.
 
 This module is designed for CRM import CSV files where the original data must
@@ -78,7 +78,7 @@ CONTACT_PATHS = [
     "about",
 ]
 
-AUDIT_COLUMNS = [
+BASE_AUDIT_COLUMNS = [
     "Proposed Website",
     "Website Source URL",
     "Website Confidence",
@@ -91,12 +91,33 @@ AUDIT_COLUMNS = [
     "Enrichment Notes",
 ]
 
+CANDIDATE_FIELDS = ["Website", "Phone", "Email"]
+MAX_CANDIDATES_PER_FIELD = 3
+
+CANDIDATE_AUDIT_COLUMNS = [
+    f"Candidate {field_name} {candidate_no} {suffix}"
+    for field_name in CANDIDATE_FIELDS
+    for candidate_no in range(1, MAX_CANDIDATES_PER_FIELD + 1)
+    for suffix in ["Value", "Source URL", "Confidence", "Reason"]
+]
+
+AUDIT_COLUMNS = BASE_AUDIT_COLUMNS + CANDIDATE_AUDIT_COLUMNS
+
 
 @dataclass
 class SearchResult:
     title: str
     url: str
     snippet: str = ""
+
+
+@dataclass
+class CandidateMatch:
+    field_name: str
+    value: str
+    source_url: str
+    confidence: float
+    reason: str
 
 
 @dataclass
@@ -130,6 +151,44 @@ class RowProposal:
     phone: FieldProposal = field(default_factory=FieldProposal)
     email: FieldProposal = field(default_factory=FieldProposal)
     notes: List[str] = field(default_factory=list)
+    candidates: List[CandidateMatch] = field(default_factory=list)
+
+    def add_candidate(
+        self,
+        field_name: str,
+        value: Optional[str],
+        source_url: Optional[str],
+        confidence: float,
+        reason: str,
+    ) -> None:
+        clean_value = clean_cell(value)
+        clean_source = clean_cell(source_url) or clean_value
+        if not clean_value:
+            return
+        confidence = round(float(confidence), 2)
+        key_field = field_name.lower().strip()
+        key_value = clean_value.lower().strip()
+        for existing in self.candidates:
+            if existing.field_name.lower() == key_field and existing.value.lower().strip() == key_value:
+                if confidence > existing.confidence:
+                    existing.confidence = confidence
+                    existing.source_url = clean_source or existing.source_url
+                    existing.reason = reason
+                return
+        self.candidates.append(
+            CandidateMatch(
+                field_name=field_name,
+                value=clean_value,
+                source_url=clean_source or "",
+                confidence=confidence,
+                reason=reason,
+            )
+        )
+
+    def top_candidates(self, field_name: str, limit: int = MAX_CANDIDATES_PER_FIELD) -> List[CandidateMatch]:
+        key = field_name.lower().strip()
+        matches = [candidate for candidate in self.candidates if candidate.field_name.lower() == key]
+        return sorted(matches, key=lambda candidate: candidate.confidence, reverse=True)[:limit]
 
 
 def clean_cell(value: Any) -> Optional[str]:
@@ -230,6 +289,39 @@ def is_probably_official_result(result: SearchResult, company_name: str, area: s
     return confidence >= 0.70, confidence, f"{token_hits}/{len(tokens)} distinctive company tokens matched"
 
 
+def score_candidate_search_result(result: SearchResult, company_name: str, area: str) -> Tuple[float, str]:
+    """Score a lower-confidence search result for manual review.
+
+    This is intentionally less strict than verified proposals. It lets the app
+    show possible matches to the user without writing them into CRM fields.
+    """
+    domain = get_domain(result.url)
+    if not domain or not result.url:
+        return 0.0, "No usable URL"
+
+    haystack = normalize_text(" ".join([result.title, result.snippet, domain, result.url]))
+    tokens = company_tokens(company_name)
+    token_hits = sum(1 for token in tokens if token in haystack)
+    token_ratio = token_hits / max(len(tokens), 1)
+    area_text = normalize_text(area or "Galway Ireland")
+    area_hit = any(part in haystack for part in area_text.split() if len(part) >= 4) or "galway" in haystack
+    domain_hit = any(token in normalize_text(domain) for token in tokens)
+    directory = is_directory_domain(domain)
+
+    confidence = 0.30 + (0.35 * token_ratio) + (0.10 if area_hit else 0.0) + (0.10 if domain_hit else 0.0)
+    if directory:
+        confidence = min(confidence, 0.55)
+        label = "Directory/social search result - manual checking only"
+    else:
+        confidence = min(confidence, 0.85)
+        label = "Possible official website candidate"
+
+    reason = f"{label}; {token_hits}/{len(tokens)} distinctive tokens matched"
+    if area_hit:
+        reason += "; location signal found"
+    return round(confidence, 2), reason
+
+
 def ddg_search(query: str, max_results: int = 8) -> List[SearchResult]:
     url = DUCKDUCKGO_HTML_URL.format(query=urllib.parse.quote(query))
     headers = {"User-Agent": USER_AGENT}
@@ -281,6 +373,118 @@ def candidate_contact_urls(base_url: str) -> List[str]:
             seen.add(url)
             deduped.append(url)
     return deduped
+
+
+def root_url(url: str) -> str:
+    """Return scheme + domain for a URL."""
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def domain_guess_slugs(company_name: str) -> List[str]:
+    """Generate conservative domain slugs from a company name.
+
+    This is used only as a fallback for candidate review. It helps with local
+    businesses that do not appear reliably in DuckDuckGo HTML results.
+    """
+    words = normalize_text(company_name).split()
+    remove = {
+        "the",
+        "and",
+        "of",
+        "galway",
+        "ireland",
+        "ltd",
+        "limited",
+        "company",
+        "services",
+        "service",
+    }
+    words = [word for word in words if word not in remove]
+    if not words:
+        return []
+
+    full = "".join(words)
+    variants = [full]
+
+    # Common Irish SME naming patterns.
+    replacements = [
+        ("physiotherapy", "physio"),
+        ("physio", "physiotherapy"),
+        ("injuryclinic", "injury"),
+        ("sportsinjuryclinic", "sportsinjury"),
+    ]
+    for old, new in replacements:
+        if old in full:
+            variants.append(full.replace(old, new))
+
+    # Try removing generic trailing words but keep the full version first.
+    for generic in ["clinic", "practice", "therapy"]:
+        if full.endswith(generic) and len(full) > len(generic) + 4:
+            variants.append(full[: -len(generic)])
+
+    # First distinctive word + physio/physiotherapy catches names like
+    # alliancephysiotherapy.com and barna-physio style sites.
+    first = words[0]
+    if len(first) >= 4:
+        variants.extend([f"{first}physio", f"{first}physiotherapy"])
+
+    deduped: List[str] = []
+    for variant in variants:
+        variant = re.sub(r"[^a-z0-9]", "", variant)
+        if len(variant) >= 6 and variant not in deduped:
+            deduped.append(variant)
+    return deduped[:5]
+
+
+def guessed_website_urls(company_name: str) -> List[str]:
+    """Return a short list of likely official domains to check directly."""
+    urls: List[str] = []
+    for slug in domain_guess_slugs(company_name):
+        for tld in ["ie", "com"]:
+            urls.append(f"https://{slug}.{tld}")
+            urls.append(f"https://www.{slug}.{tld}")
+    # Keep this deliberately short so a 10-row test does not become slow.
+    return urls[:16]
+
+
+def score_page_match(url: str, html: str, company_name: str, area: str) -> Tuple[float, str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    text = soup.get_text(" ", strip=True)[:50_000]
+    domain = get_domain(url)
+    haystack = normalize_text(" ".join([title, text, domain, url]))
+
+    tokens = company_tokens(company_name)
+    token_hits = sum(1 for token in tokens if token in haystack)
+    token_ratio = token_hits / max(len(tokens), 1)
+
+    company_phrase = normalize_text(company_name)
+    phrase_hit = company_phrase in haystack
+
+    area_text = normalize_text(area or "Galway Ireland")
+    area_parts = [part for part in area_text.split() if len(part) >= 4]
+    area_hit = "galway" in haystack or any(part in haystack for part in area_parts)
+
+    domain_hit = any(token in normalize_text(domain) for token in tokens)
+
+    confidence = 0.35
+    confidence += 0.25 * token_ratio
+    confidence += 0.15 if domain_hit else 0.0
+    confidence += 0.15 if phrase_hit else 0.0
+    confidence += 0.10 if area_hit else 0.0
+    confidence = min(confidence, 0.92)
+
+    reason_parts = [f"direct domain/page check; {token_hits}/{len(tokens)} distinctive tokens matched"]
+    if domain_hit:
+        reason_parts.append("domain contains distinctive token")
+    if phrase_hit:
+        reason_parts.append("company phrase found on page")
+    if area_hit:
+        reason_parts.append("location signal found")
+    return round(confidence, 2), "; ".join(reason_parts)
 
 
 def extract_emails(text: str) -> List[str]:
@@ -425,35 +629,81 @@ def enrich_row(
     elif use_apollo and not apollo_api_key:
         proposal.notes.append("Apollo enabled but no API key found; skipped Apollo")
 
-    # Use existing website as source for phone/email if it exists.
     urls_to_check: List[str] = []
+
+    # Use existing website as source for phone/email if it exists.
     if existing_website:
         urls_to_check.extend(candidate_contact_urls(existing_website))
         proposal.website.update_if_better(existing_website, existing_website, 1.0, "Existing CRM website")
 
+    # v3 fallback: direct likely-domain checks. This catches SMEs that search
+    # engines do not return reliably, while still keeping values in audit review.
+    if not existing_website and {"website", "phone", "email"} & targets:
+        for guess_url in guessed_website_urls(company_name):
+            if delay:
+                time.sleep(delay)
+            html, final_url = fetch_page(guess_url)
+            if not html:
+                continue
+            source_url = root_url(final_url or guess_url)
+            confidence, reason = score_page_match(source_url, html, company_name, area)
+            if confidence >= 0.50:
+                proposal.add_candidate("Website", source_url, source_url, confidence, reason)
+                urls_to_check.extend(candidate_contact_urls(source_url))
+            if confidence >= 0.78 and "website" in targets:
+                proposal.website.update_if_better(source_url, source_url, confidence, reason)
+
+            combined = html + " " + BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+            if "phone" in targets and not has_value(row.get("Phone")) and confidence >= 0.55:
+                phones = extract_irish_phones(combined)
+                if phones:
+                    phone_conf = min(0.88, confidence + 0.05)
+                    proposal.add_candidate("Phone", phones[0], source_url, phone_conf, "Phone found on direct domain candidate")
+                    proposal.phone.update_if_better(phones[0], source_url, phone_conf, "Phone found on direct domain candidate")
+            if "email" in targets and not has_value(row.get("Email")) and confidence >= 0.60:
+                emails = extract_emails(combined)
+                if emails:
+                    preferred = sorted(
+                        emails,
+                        key=lambda e: (not e.startswith(("info@", "contact@", "hello@", "admin@", "reception@")), e),
+                    )[0]
+                    email_conf = min(0.86, confidence + 0.03)
+                    proposal.add_candidate("Email", preferred, source_url, email_conf, "Email found on direct domain candidate")
+                    proposal.email.update_if_better(preferred, source_url, email_conf, "Email found on direct domain candidate")
+
     # Search for official website and possible snippets.
-    search_results: List[SearchResult] = []
     if not existing_website or "phone" in targets or "email" in targets:
         for query in build_queries(company_name, area, category):
             if delay:
                 time.sleep(delay)
             results = ddg_search(query, max_results=8)
-            search_results.extend(results)
+            if len(results) == 1 and results[0].title == "SEARCH_ERROR":
+                proposal.notes.append(f"Search error: {results[0].snippet[:120]}")
+                continue
+            if not results:
+                proposal.notes.append(f"No search results for query: {query[:80]}")
             for result in results:
                 if not result.url:
                     continue
+
+                candidate_confidence, candidate_reason = score_candidate_search_result(result, company_name, area)
+                if "website" in targets and candidate_confidence >= 0.35:
+                    proposal.add_candidate("Website", result.url, result.url, candidate_confidence, candidate_reason)
+
                 ok, confidence, note = is_probably_official_result(result, company_name, area)
                 if ok and "website" in targets:
                     proposal.website.update_if_better(result.url, result.url, confidence, note)
                     urls_to_check.extend(candidate_contact_urls(result.url))
+
                 # Directory snippets can still provide phone numbers, but use lower confidence.
                 if "phone" in targets and result.snippet:
                     phones = extract_irish_phones(result.snippet)
                     if phones:
-                        snippet_conf = 0.65 if is_directory_domain(get_domain(result.url)) else min(confidence, 0.75)
+                        snippet_conf = 0.65 if is_directory_domain(get_domain(result.url)) else min(max(confidence, candidate_confidence), 0.75)
+                        proposal.add_candidate("Phone", phones[0], result.url, snippet_conf, "Phone from search result snippet - manual check")
                         proposal.phone.update_if_better(phones[0], result.url, snippet_conf, "Phone from search result snippet")
 
-    # If Apollo/search found a proposed website, scrape it for phone/email.
+    # If Apollo/search/domain fallback found a proposed website, scrape it for phone/email.
     if proposal.website.value:
         urls_to_check.extend(candidate_contact_urls(proposal.website.value))
 
@@ -475,6 +725,7 @@ def enrich_row(
             phones = extract_irish_phones(combined)
             if phones:
                 conf = 0.88 if proposal.website.confidence >= 0.80 or existing_website else 0.75
+                proposal.add_candidate("Phone", phones[0], source, conf, "Phone found on website/contact page")
                 proposal.phone.update_if_better(phones[0], source, conf, "Phone found on website/contact page")
 
         if "email" in targets and not has_value(row.get("Email")):
@@ -485,10 +736,14 @@ def enrich_row(
                     key=lambda e: (not e.startswith(("info@", "contact@", "hello@", "admin@", "reception@")), e),
                 )[0]
                 conf = 0.85 if proposal.website.confidence >= 0.80 or existing_website else 0.70
+                proposal.add_candidate("Email", preferred, source, conf, "Email found on website/contact page")
                 proposal.email.update_if_better(preferred, source, conf, "Email found on website/contact page")
 
-    if not proposal.notes and not any([proposal.website.value, proposal.phone.value, proposal.email.value]):
-        proposal.notes.append("No reliable proposal found")
+    if not any([proposal.website.value, proposal.phone.value, proposal.email.value]):
+        if proposal.candidates:
+            proposal.notes.append("Candidate matches found for manual review; no verified proposal selected")
+        elif not proposal.notes:
+            proposal.notes.append("No reliable proposal found")
     return proposal
 
 
@@ -496,7 +751,9 @@ def add_audit_columns(df: pd.DataFrame) -> pd.DataFrame:
     output = df.copy()
     for col in AUDIT_COLUMNS:
         if col not in output.columns:
-            output[col] = ""
+            output[col] = pd.Series([""] * len(output), index=output.index, dtype="object")
+        else:
+            output[col] = output[col].astype("object")
     return output
 
 
@@ -516,9 +773,19 @@ def apply_proposal_to_row(
         output.at[idx, f"{prefix} Source URL"] = field_proposal.source_url or ""
         output.at[idx, f"{prefix} Confidence"] = f"{field_proposal.confidence:.2f}" if field_proposal.value else ""
 
+    def write_candidates(prefix: str) -> None:
+        for position, candidate in enumerate(proposal.top_candidates(prefix), start=1):
+            output.at[idx, f"Candidate {prefix} {position} Value"] = candidate.value
+            output.at[idx, f"Candidate {prefix} {position} Source URL"] = candidate.source_url
+            output.at[idx, f"Candidate {prefix} {position} Confidence"] = f"{candidate.confidence:.2f}"
+            output.at[idx, f"Candidate {prefix} {position} Reason"] = candidate.reason
+
     write_audit("Website", proposal.website)
     write_audit("Phone", proposal.phone)
     write_audit("Email", proposal.email)
+    write_candidates("Website")
+    write_candidates("Phone")
+    write_candidates("Email")
     output.at[idx, "Enrichment Notes"] = "; ".join(proposal.notes + proposal.website.notes + proposal.phone.notes + proposal.email.notes)
 
     if mode != "verified_only":
@@ -681,4 +948,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
