@@ -32,6 +32,8 @@ if "source_file_name" not in st.session_state:
     st.session_state.source_file_name = None
 if "last_mode" not in st.session_state:
     st.session_state.last_mode = "preview"
+if "last_run_settings" not in st.session_state:
+    st.session_state.last_run_settings = None
 
 with st.sidebar:
     st.header("Settings")
@@ -112,11 +114,58 @@ with st.sidebar:
     else:
         st.caption("No APOLLO_API_KEY found. Apollo will be skipped unless you paste a key above.")
 
+
+def build_run_settings(
+    *,
+    file_name: str | None,
+    mode: str,
+    row_limit: int,
+    min_confidence: float,
+    delay: float,
+    use_apollo_effective: bool,
+    target_fields: list[str],
+) -> dict:
+    """Settings that affect the actual enrichment result.
+
+    Display-only controls such as audit-table filters are intentionally excluded,
+    so toggling those will not mark a result as stale.
+    """
+    return {
+        "source_file": file_name or "",
+        "mode": mode,
+        "rows_to_research": int(row_limit),
+        "minimum_confidence": round(float(min_confidence), 2),
+        "delay_seconds": round(float(delay), 2),
+        "apollo_enabled_for_run": bool(use_apollo_effective),
+        "fields_to_research": list(target_fields),
+    }
+
+
+def settings_changed(current: dict, previous: dict | None) -> bool:
+    if previous is None:
+        return False
+    return current != previous
+
+
 uploaded_file = st.file_uploader("Upload a CRM import CSV", type=["csv"])
+
+current_run_settings = build_run_settings(
+    file_name=uploaded_file.name if uploaded_file is not None else None,
+    mode=mode,
+    row_limit=int(row_limit),
+    min_confidence=float(min_confidence),
+    delay=float(delay),
+    use_apollo_effective=bool(use_apollo and (apollo_key_input.strip() or os.getenv("APOLLO_API_KEY"))),
+    target_fields=target_fields,
+)
 
 st.info(
     "Recommended test: Preview only, 10 rows, Apollo off, Website + Phone only. "
     "Use the audit CSV for review. Use the CRM import CSV only after verified-only mode shows good changes."
+)
+st.caption(
+    "If a 25-row run seems to stall, watch the progress line after clicking Run research. "
+    "The audit/CSV download appears only after the run fully completes."
 )
 
 
@@ -177,7 +226,18 @@ if uploaded_file is not None:
         else:
             use_apollo_effective = use_apollo
 
-        with st.spinner("Researching records. This may take a few minutes..."):
+        progress_bar = st.progress(0, text="Starting research...")
+        status_box = st.empty()
+
+        def update_progress(done: int, total: int, company_name: str) -> None:
+            if total <= 0:
+                progress_bar.progress(0, text="No rows need research.")
+                return
+            pct = min(max(done / total, 0.0), 1.0)
+            progress_bar.progress(pct, text=f"Researching {done}/{total}: {company_name}")
+            status_box.caption(f"Current/last row: {company_name}")
+
+        with st.spinner("Researching records. This may take a few minutes. Keep this tab open..."):
             result_df = enrich_dataframe(
                 df,
                 mode=mode,
@@ -187,15 +247,43 @@ if uploaded_file is not None:
                 use_apollo=use_apollo_effective,
                 apollo_api_key=api_key,
                 target_fields=target_fields,
+                progress_callback=update_progress,
             )
+        progress_bar.progress(1.0, text="Research completed.")
+        status_box.empty()
 
         st.session_state.result_df = result_df
         st.session_state.source_file_name = uploaded_file.name
         st.session_state.last_mode = mode
+        st.session_state.last_run_settings = build_run_settings(
+            file_name=uploaded_file.name,
+            mode=mode,
+            row_limit=int(row_limit),
+            min_confidence=float(min_confidence),
+            delay=float(delay),
+            use_apollo_effective=use_apollo_effective,
+            target_fields=target_fields,
+        )
         st.success("Research completed.")
 
 if st.session_state.result_df is not None:
     result_df = st.session_state.result_df
+    is_stale_result = settings_changed(current_run_settings, st.session_state.last_run_settings)
+
+    if st.session_state.last_run_settings:
+        with st.expander("Last run settings", expanded=False):
+            st.json(st.session_state.last_run_settings)
+
+    if is_stale_result:
+        st.warning(
+            "The table and downloads below are from a previous run. "
+            "Your current sidebar settings are different. Run research again before downloading/importing."
+        )
+        if st.button("Clear old results"):
+            st.session_state.result_df = None
+            st.session_state.last_run_settings = None
+            st.rerun()
+
     audit_df = audit_columns_only(result_df)
     final_import_df = crm_import_columns_only(result_df)
     visible_audit = build_visible_audit(
@@ -228,6 +316,7 @@ if st.session_state.result_df is not None:
         "Download audit CSV for review - not for CRM import",
         data=audit_df.to_csv(index=False).encode("utf-8"),
         file_name="csv_genie_audit.csv",
+        disabled=is_stale_result,
         mime="text/csv",
         key="download_audit_csv",
     )
@@ -249,5 +338,6 @@ if st.session_state.result_df is not None:
             data=final_import_df.to_csv(index=False).encode("utf-8"),
             file_name="csv_genie_crm_import.csv",
             mime="text/csv",
+            disabled=is_stale_result,
             key="download_crm_csv",
         )

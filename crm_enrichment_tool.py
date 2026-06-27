@@ -24,7 +24,7 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -41,7 +41,8 @@ APOLLO_BASE_URL = "https://api.apollo.io/api/v1"
 APOLLO_API_KEY_ENV = "APOLLO_API_KEY"
 DUCKDUCKGO_HTML_URL = "https://duckduckgo.com/html/?q={query}"
 
-DEFAULT_TIMEOUT = 15
+DEFAULT_TIMEOUT = 10
+DIRECT_DOMAIN_TIMEOUT = 4
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -68,6 +69,36 @@ DIRECTORY_DOMAINS = {
     "mapcarta.com",
     "cylex.ie",
     "locallife.ie",
+    # Booking, social, directory and map/listing pages should stay candidate-only.
+    "fresha.com",
+    "booksy.com",
+    "treatwell.ie",
+    "treatwell.co.uk",
+    "setmore.com",
+    "simplybook.it",
+    "appointy.com",
+    "acuityscheduling.com",
+    "square.site",
+    "wixsite.com",
+    "weebly.com",
+    "linktr.ee",
+    "maps.google.com",
+    "google.com",
+    "google.ie",
+    "bing.com",
+    "apple.com",
+    "infobel.com",
+    "local.infobel.ie",
+    "kompass.com",
+    "tuugo.info",
+    "bizireland.com",
+}
+
+SUSPICIOUS_PHONE_REASONS = {
+    "invalid_length": "Rejected phone candidate: invalid Irish phone length",
+    "repeated_digits": "Rejected phone candidate: suspicious repeated digits",
+    "sequential_digits": "Rejected phone candidate: suspicious sequential digits",
+    "invalid_prefix": "Rejected phone candidate: unexpected Irish phone prefix",
 }
 
 CONTACT_PATHS = [
@@ -266,6 +297,26 @@ def is_directory_domain(domain: str) -> bool:
     return any(domain == bad or domain.endswith("." + bad) for bad in DIRECTORY_DOMAINS)
 
 
+def same_domain(url_a: Optional[str], url_b: Optional[str]) -> bool:
+    """Return True when two URLs resolve to the same root domain."""
+    if not url_a or not url_b:
+        return False
+    return get_domain(url_a) == get_domain(url_b)
+
+
+def is_official_phone_source(source_url: Optional[str], official_website: Optional[str]) -> bool:
+    """Phone values are verified only from the proposed/existing official website."""
+    if not source_url or not official_website:
+        return False
+    source_domain = get_domain(source_url)
+    official_domain = get_domain(official_website)
+    if not source_domain or not official_domain:
+        return False
+    if is_directory_domain(source_domain):
+        return False
+    return source_domain == official_domain
+
+
 def is_probably_official_result(result: SearchResult, company_name: str, area: str) -> Tuple[bool, float, str]:
     domain = get_domain(result.url)
     if not domain or is_directory_domain(domain):
@@ -346,10 +397,11 @@ def ddg_search(query: str, max_results: int = 8) -> List[SearchResult]:
     return results
 
 
-def fetch_page(url: str) -> Tuple[Optional[str], Optional[str]]:
+def fetch_page(url: str, *, timeout: Optional[float] = None) -> Tuple[Optional[str], Optional[str]]:
     headers = {"User-Agent": USER_AGENT}
+    request_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
     try:
-        response = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
+        response = requests.get(url, headers=headers, timeout=request_timeout, allow_redirects=True)
         if not response.ok or "text/html" not in response.headers.get("Content-Type", ""):
             return None, None
         return response.text[:250_000], response.url
@@ -446,8 +498,9 @@ def guessed_website_urls(company_name: str) -> List[str]:
         for tld in ["ie", "com"]:
             urls.append(f"https://{slug}.{tld}")
             urls.append(f"https://www.{slug}.{tld}")
-    # Keep this deliberately short so a 10-row test does not become slow.
-    return urls[:16]
+    # Keep this deliberately short so a 25-row test does not become slow.
+    # Each direct-domain check can otherwise add several seconds when a domain does not exist.
+    return urls[:8]
 
 
 def score_page_match(url: str, html: str, company_name: str, area: str) -> Tuple[float, str]:
@@ -499,29 +552,64 @@ def extract_emails(text: str) -> List[str]:
     return cleaned
 
 
+def normalize_irish_phone(match: str) -> Optional[str]:
+    """Return a safe Irish-style phone string or None for obvious false positives."""
+    if not match:
+        return None
+
+    digits = re.sub(r"\D", "", match)
+    if digits.startswith("00353"):
+        digits = "353" + digits[5:]
+
+    if digits.startswith("353"):
+        national = "0" + digits[3:]
+    elif digits.startswith("0"):
+        national = digits
+    else:
+        return None
+
+    # Irish geographic/mobile numbers are usually 9-10 digits including the 0.
+    # This deliberately rejects junk strings like 06666666666.
+    if len(national) not in {9, 10}:
+        return None
+
+    if not re.match(r"^0[1-9]", national):
+        return None
+
+    # Reject obvious placeholders, tracking fragments and repeated-digit junk.
+    significant = national[1:]
+    if re.search(r"(\d)\1{5,}", significant):
+        return None
+    if len(set(significant)) <= 2 and len(significant) >= 8:
+        return None
+
+    sequential_samples = {
+        "0123456789",
+        "1234567890",
+        "123456789",
+        "9876543210",
+        "0987654321",
+        "987654321",
+    }
+    if significant in sequential_samples or national in sequential_samples:
+        return None
+
+    return national
+
+
 def extract_irish_phones(text: str) -> List[str]:
     if not text:
         return []
     # Handles +353, 00353, 091, 01, 021, 087, etc. This intentionally keeps the
-    # match broad, then filters by digit count.
+    # match broad, then normalises and rejects suspicious/placeholder numbers.
     raw_matches = re.findall(
         r"(?:(?:\+|00)353[\s\-\(\)]*)?0?\d{1,3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3,4}",
         text,
     )
     phones: List[str] = []
     for match in raw_matches:
-        digits = re.sub(r"\D", "", match)
-        if digits.startswith("353"):
-            normalized = "+353 " + digits[3:]
-        elif digits.startswith("00353"):
-            normalized = "+353 " + digits[5:]
-        elif digits.startswith("0"):
-            normalized = digits
-        else:
-            continue
-        # Filter out very short/long false positives.
-        digit_count = len(re.sub(r"\D", "", normalized))
-        if 9 <= digit_count <= 13 and normalized not in phones:
+        normalized = normalize_irish_phone(match)
+        if normalized and normalized not in phones:
             phones.append(normalized)
     return phones
 
@@ -622,8 +710,12 @@ def enrich_row(
             phone = phone_obj.get("number") if isinstance(phone_obj, dict) else org.get("phone")
             if "website" in targets:
                 proposal.website.update_if_better(website, "Apollo Organization Enrichment", confidence, "Apollo match")
-            if "phone" in targets:
-                proposal.phone.update_if_better(phone, "Apollo Organization Enrichment", confidence, "Apollo match")
+            if "phone" in targets and phone:
+                # Apollo phone values are useful candidates, but not verified.
+                # Verified phone proposals must come from the official website/contact page.
+                normalized_phone = normalize_irish_phone(str(phone))
+                if normalized_phone:
+                    proposal.add_candidate("Phone", normalized_phone, "Apollo Organization Enrichment", min(confidence, 0.70), "Apollo phone candidate - manual check")
         elif isinstance(apollo_data, dict) and apollo_data.get("_error"):
             proposal.notes.append(f"Apollo skipped/error: {apollo_data.get('_error')[:120]}")
     elif use_apollo and not apollo_api_key:
@@ -642,7 +734,7 @@ def enrich_row(
         for guess_url in guessed_website_urls(company_name):
             if delay:
                 time.sleep(delay)
-            html, final_url = fetch_page(guess_url)
+            html, final_url = fetch_page(guess_url, timeout=DIRECT_DOMAIN_TIMEOUT)
             if not html:
                 continue
             source_url = root_url(final_url or guess_url)
@@ -658,8 +750,7 @@ def enrich_row(
                 phones = extract_irish_phones(combined)
                 if phones:
                     phone_conf = min(0.88, confidence + 0.05)
-                    proposal.add_candidate("Phone", phones[0], source_url, phone_conf, "Phone found on direct domain candidate")
-                    proposal.phone.update_if_better(phones[0], source_url, phone_conf, "Phone found on direct domain candidate")
+                    proposal.add_candidate("Phone", phones[0], source_url, phone_conf, "Phone found on direct domain candidate - verified only after official-site scrape")
             if "email" in targets and not has_value(row.get("Email")) and confidence >= 0.60:
                 emails = extract_emails(combined)
                 if emails:
@@ -700,8 +791,7 @@ def enrich_row(
                     phones = extract_irish_phones(result.snippet)
                     if phones:
                         snippet_conf = 0.65 if is_directory_domain(get_domain(result.url)) else min(max(confidence, candidate_confidence), 0.75)
-                        proposal.add_candidate("Phone", phones[0], result.url, snippet_conf, "Phone from search result snippet - manual check")
-                        proposal.phone.update_if_better(phones[0], result.url, snippet_conf, "Phone from search result snippet")
+                        proposal.add_candidate("Phone", phones[0], result.url, snippet_conf, "Phone from search result snippet - manual check only")
 
     # If Apollo/search/domain fallback found a proposed website, scrape it for phone/email.
     if proposal.website.value:
@@ -724,9 +814,13 @@ def enrich_row(
         if "phone" in targets and not has_value(row.get("Phone")):
             phones = extract_irish_phones(combined)
             if phones:
-                conf = 0.88 if proposal.website.confidence >= 0.80 or existing_website else 0.75
-                proposal.add_candidate("Phone", phones[0], source, conf, "Phone found on website/contact page")
-                proposal.phone.update_if_better(phones[0], source, conf, "Phone found on website/contact page")
+                official_source = proposal.website.value or existing_website
+                is_verified_source = is_official_phone_source(source, official_source)
+                conf = 0.88 if is_verified_source and (proposal.website.confidence >= 0.80 or existing_website) else 0.68
+                reason = "Phone found on proposed/existing official website contact page" if is_verified_source else "Phone found on non-official candidate page - manual check only"
+                proposal.add_candidate("Phone", phones[0], source, conf, reason)
+                if is_verified_source:
+                    proposal.phone.update_if_better(phones[0], source, conf, reason)
 
         if "email" in targets and not has_value(row.get("Email")):
             emails = extract_emails(combined)
@@ -833,6 +927,7 @@ def enrich_dataframe(
     use_apollo: bool = False,
     apollo_api_key: Optional[str] = None,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> pd.DataFrame:
     """
     Enrich a dataframe and return original rows plus audit/proposal columns.
@@ -848,24 +943,39 @@ def enrich_dataframe(
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(missing)}")
 
-    researched = 0
+    rows_needing_research: List[Tuple[int, pd.Series]] = []
     for idx, row in output.iterrows():
         needs_research = any(
             field in target_fields and not has_value(row.get(field))
             for field in ["Website", "Phone", "Email"]
         )
-        if not needs_research:
-            continue
+        if needs_research:
+            rows_needing_research.append((idx, row))
+
+    max_research = len(rows_needing_research) if row_limit is None else min(int(row_limit), len(rows_needing_research))
+
+    researched = 0
+    for idx, row in rows_needing_research:
         if row_limit is not None and researched >= row_limit:
             output.at[idx, "Enrichment Notes"] = "Not researched due to row limit"
             continue
-        proposal = enrich_row(
-            row,
-            use_apollo=use_apollo,
-            apollo_api_key=apollo_api_key,
-            delay=delay,
-            target_fields=target_fields,
-        )
+
+        company_for_progress = clean_cell(row.get("Company Name")) or f"row {idx}"
+        if progress_callback:
+            progress_callback(researched, max_research, company_for_progress)
+
+        try:
+            proposal = enrich_row(
+                row,
+                use_apollo=use_apollo,
+                apollo_api_key=apollo_api_key,
+                delay=delay,
+                target_fields=target_fields,
+            )
+        except Exception as exc:
+            proposal = RowProposal()
+            proposal.notes.append(f"Research error: {type(exc).__name__}: {str(exc)[:180]}")
+
         apply_proposal_to_row(
             output,
             idx,
@@ -875,6 +985,8 @@ def enrich_dataframe(
             target_fields=target_fields,
         )
         researched += 1
+        if progress_callback:
+            progress_callback(researched, max_research, company_for_progress)
     return output
 
 
