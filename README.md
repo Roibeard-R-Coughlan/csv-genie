@@ -67,3 +67,9 @@ python -m streamlit run streamlit_app.py
 - Reduces direct-domain timeout and limits direct-domain guesses so 25-row tests finish faster.
 - Catches per-row research errors and writes them into `Enrichment Notes` instead of stopping the whole app.
 - CSV downloads appear after the progress bar reaches completion.
+
+
+## v4.2 update
+
+- Delay between web requests now defaults to 1.00 seconds because testing showed more reliable candidate discovery than 0.00.
+- Apollo remains optional and off by default.

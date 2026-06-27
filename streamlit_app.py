@@ -68,8 +68,9 @@ with st.sidebar:
         "Delay between web requests (seconds)",
         min_value=0.0,
         max_value=10.0,
-        value=0.0,
+        value=1.0,
         step=0.5,
+        help="Default is 1.00 because testing showed it gives more reliable results than 0.00.",
     )
 
     st.subheader("Fields to research")
@@ -160,7 +161,7 @@ current_run_settings = build_run_settings(
 )
 
 st.info(
-    "Recommended test: Preview only, 10 rows, Apollo off, Website + Phone only. "
+    "Recommended test: Preview only, 10 rows, 1.00s delay, Apollo off, Website + Phone only. "
     "Use the audit CSV for review. Use the CRM import CSV only after verified-only mode shows good changes."
 )
 st.caption(
