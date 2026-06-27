@@ -1,4 +1,4 @@
-"""
+﻿"""
 CSV Genie - verified CRM enrichment engine.
 
 This module is designed for CRM import CSV files where the original data must
@@ -514,7 +514,7 @@ def apply_proposal_to_row(
     def write_audit(prefix: str, field_proposal: FieldProposal) -> None:
         output.at[idx, f"Proposed {prefix}"] = field_proposal.value or ""
         output.at[idx, f"{prefix} Source URL"] = field_proposal.source_url or ""
-        output.at[idx, f"{prefix} Confidence"] = field_proposal.confidence if field_proposal.value else ""
+        output.at[idx, f"{prefix} Confidence"] = f"{field_proposal.confidence:.2f}" if field_proposal.value else ""
 
     write_audit("Website", proposal.website)
     write_audit("Phone", proposal.phone)
@@ -681,3 +681,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
