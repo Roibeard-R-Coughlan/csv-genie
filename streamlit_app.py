@@ -103,11 +103,11 @@ with st.sidebar:
     search_provider_label = st.selectbox(
         "Web search backend",
         [
-            "DuckDuckGo fallback - free",
-            "SerpAPI Google results - recommended for local businesses",
+            "DuckDuckGo - free",
+            "SerpAPI Google results - optional paid",
         ],
         index=0,
-        help="SerpAPI usually matches Google results better for local business lookups. DuckDuckGo is free but less consistent.",
+        help="DuckDuckGo is free and usually sufficient. SerpAPI provides Google results but costs credits.",
     )
     search_provider = "serpapi" if search_provider_label.startswith("SerpAPI") else "duckduckgo"
     serpapi_key_input = st.text_input(
@@ -116,6 +116,7 @@ with st.sidebar:
         value="",
         help="Optional. Leave blank to use SERPAPI_API_KEY from .env or environment variables.",
     )
+    st.warning("⚠️ SerpAPI is a paid API provider. Do not use for bulk testing unless you intend to spend credits.")
     serpapi_env_key_exists = bool(os.getenv("SERPAPI_API_KEY"))
     if serpapi_env_key_exists:
         st.caption("SERPAPI_API_KEY found in environment/.env")
@@ -128,24 +129,6 @@ with st.sidebar:
         help="Used by SerpAPI/Google. Keep this local, e.g. Galway, County Galway, Ireland, to reduce irrelevant directory results.",
     )
 
-    st.subheader("Apollo")
-    use_apollo = st.checkbox(
-        "Use Apollo API",
-        value=False,
-        help="Disabled by default to protect credits. Enable only when you want Apollo lookups.",
-    )
-    apollo_key_input = st.text_input(
-        "Apollo API key for this session only",
-        type="password",
-        value="",
-        help="Optional. Leave blank to use APOLLO_API_KEY from .env or environment variables.",
-    )
-    env_key_exists = bool(os.getenv("APOLLO_API_KEY"))
-    if env_key_exists:
-        st.caption("APOLLO_API_KEY found in environment/.env")
-    else:
-        st.caption("No APOLLO_API_KEY found. Apollo will be skipped unless you paste a key above.")
-
 
 def build_run_settings(
     *,
@@ -154,7 +137,6 @@ def build_run_settings(
     row_limit: int,
     min_confidence: float,
     delay: float,
-    use_apollo_effective: bool,
     target_fields: list[str],
     search_provider: str,
     search_location: str,
@@ -170,7 +152,6 @@ def build_run_settings(
         "rows_to_research": int(row_limit),
         "minimum_confidence": round(float(min_confidence), 2),
         "delay_seconds": round(float(delay), 2),
-        "apollo_enabled_for_run": bool(use_apollo_effective),
         "fields_to_research": list(target_fields),
         "search_provider": search_provider,
         "search_location": search_location or DEFAULT_SEARCH_LOCATION,
@@ -195,15 +176,14 @@ current_run_settings = build_run_settings(
     row_limit=int(row_limit),
     min_confidence=float(min_confidence),
     delay=float(delay),
-    use_apollo_effective=bool(use_apollo and (apollo_key_input.strip() or os.getenv("APOLLO_API_KEY"))),
     target_fields=target_fields,
     search_provider=current_effective_search_provider,
     search_location=search_location,
 )
 
 st.info(
-    "Recommended test: Preview only, 10 rows, 1.00s delay, Apollo off, Website first. "
-    "Use SerpAPI when you want Google-like local-business search results. Keep Search location bias set to Galway, County Galway, Ireland. Use the audit CSV for review."
+    "Recommended test: Preview only, 10 rows, 1.00s delay, Website first. "
+    "Use DuckDuckGo for free testing; SerpAPI for Google results (paid). Keep Search location bias set to Galway, County Galway, Ireland. Use the audit CSV for review."
 )
 st.caption(
     "If a 25-row run seems to stall, watch the progress line after clicking Run research. "
@@ -268,18 +248,11 @@ if uploaded_file is not None:
         st.stop()
 
     if st.button("Run research", type="primary"):
-        api_key = apollo_key_input.strip() or os.getenv("APOLLO_API_KEY")
         serpapi_key = serpapi_key_input.strip() or os.getenv("SERPAPI_API_KEY")
         effective_search_provider = search_provider
         if search_provider == "serpapi" and not serpapi_key:
             st.warning("SerpAPI is selected but no key is available. Falling back to DuckDuckGo for this run.")
             effective_search_provider = "duckduckgo"
-
-        if use_apollo and not api_key:
-            st.warning("Apollo is enabled but no API key is available. Apollo will be skipped for this run.")
-            use_apollo_effective = False
-        else:
-            use_apollo_effective = use_apollo
 
         progress_bar = st.progress(0, text="Starting research...")
         status_box = st.empty()
@@ -299,8 +272,8 @@ if uploaded_file is not None:
                 min_confidence=float(min_confidence),
                 row_limit=int(row_limit),
                 delay=float(delay),
-                use_apollo=use_apollo_effective,
-                apollo_api_key=api_key,
+                use_apollo=False,
+                apollo_api_key=None,
                 target_fields=target_fields,
                 progress_callback=update_progress,
                 search_provider=effective_search_provider,
@@ -319,7 +292,6 @@ if uploaded_file is not None:
             row_limit=int(row_limit),
             min_confidence=float(min_confidence),
             delay=float(delay),
-            use_apollo_effective=use_apollo_effective,
             target_fields=target_fields,
             search_provider=effective_search_provider,
             search_location=search_location,

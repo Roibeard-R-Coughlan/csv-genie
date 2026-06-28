@@ -1,19 +1,11 @@
-# Secrets
-.env
+﻿.env
 .env.*
-.env.txt
+!.env.example
 
-# Python
 __pycache__/
 *.py[cod]
-.venv/
-venv/
 
-# Local outputs
-outputs/
-*_enriched.csv
-csv_genie_*.csv
+test_outputs/
+test-inputs/*.csv
 
-# OS/editor
-.DS_Store
-.vscode/
+*.log

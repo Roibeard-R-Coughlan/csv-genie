@@ -105,6 +105,13 @@ DIRECTORY_DOMAINS = {
     "yelu.ie",
     "ie.near-place.com",
     "ireland724.info",
+    # Additional directories to block (Irish local business listings, archives, free hosts)
+    "alltrack.org",
+    "dir.alltrack.org",
+    "infosinfo-ie.com",
+    "mummypages.ie",
+    "archive.org",
+    "archive.today",
 }
 
 SUSPICIOUS_PHONE_REASONS = {
@@ -805,19 +812,30 @@ def score_apollo_match(org: Dict[str, Any], company_name: str, area: str) -> flo
 def build_queries(company_name: str, area: str, category: str = "") -> List[str]:
     area = clean_cell(area) or "Galway Ireland"
     category = clean_cell(category) or ""
-    # Keep queries close to how a person would Google local SMEs.
-    # Exact-name/location queries work better than broad keyword-heavy searches
-    # and reduce directory pages outranking official websites.
+
+    # Simplify company name by removing common generic suffixes
+    simplified = company_name.lower()
+    for suffix in [" clinic", " clinics", " practice", " physiotherapy", " physio",
+                   " therapy", " ltd", " limited", " company"]:
+        if simplified.endswith(suffix):
+            simplified = company_name[:-len(suffix)]
+            break
+
     queries = [
         f'"{company_name}" "{area}"',
         f'"{company_name}" "{area}" contact',
+        f'"{simplified}" "{area}"' if simplified != company_name else None,
         f'"{company_name}" Galway',
         f'"{company_name}" official website',
         f'"{company_name}" email phone',
     ]
+
+    # Add category-based query if available
     if category:
         queries.append(f'"{company_name}" "{area}" {category}')
-    return queries
+
+    # Remove None entries from simplified name fallback
+    return [q for q in queries if q is not None]
 
 
 def enrich_row(
@@ -1065,7 +1083,11 @@ def apply_proposal_to_row(
     targets = {field.lower() for field in target_fields}
 
     def write_audit(prefix: str, field_proposal: FieldProposal) -> None:
-        output.at[idx, f"Proposed {prefix}"] = field_proposal.value or ""
+        # Canonicalize website URLs to root domain for storage
+        value = field_proposal.value
+        if prefix == "Website" and value:
+            value = root_url(value)
+        output.at[idx, f"Proposed {prefix}"] = value or ""
         output.at[idx, f"{prefix} Source URL"] = field_proposal.source_url or ""
         output.at[idx, f"{prefix} Confidence"] = f"{field_proposal.confidence:.2f}" if field_proposal.value else ""
 
@@ -1089,7 +1111,7 @@ def apply_proposal_to_row(
 
     if "website" in targets and not has_value(output.at[idx, "Website"]):
         if proposal.website.value and proposal.website.confidence >= min_confidence:
-            output.at[idx, "Website"] = proposal.website.value
+            output.at[idx, "Website"] = root_url(proposal.website.value)
 
     if "phone" in targets and not has_value(output.at[idx, "Phone"]):
         if proposal.phone.value and proposal.phone.confidence >= min_confidence:
@@ -1254,7 +1276,6 @@ def main() -> None:
     parser.add_argument("--output-file", required=True, help="Path to output CSV file")
     parser.add_argument("--delay", type=float, default=0.0, help="Optional delay between network requests in seconds")
     parser.add_argument("--limit", type=int, default=5, help="Only research the first N incomplete rows while preserving all rows")
-    parser.add_argument("--use-apollo", action="store_true", help="Use Apollo if APOLLO_API_KEY is available")
     parser.add_argument("--search-provider", choices=["duckduckgo", "serpapi"], default="duckduckgo", help="Search backend for web discovery")
     parser.add_argument("--serpapi-key", default=None, help="Optional SerpAPI key; otherwise SERPAPI_API_KEY env var is used")
     parser.add_argument("--search-location", default=DEFAULT_SEARCH_LOCATION, help="Location bias for SerpAPI/Google local results")
@@ -1268,7 +1289,7 @@ def main() -> None:
         args.output_file,
         delay=args.delay,
         max_rows=args.limit,
-        skip_apollo=not args.use_apollo,
+        skip_apollo=True,
         mode=args.mode,
         min_confidence=args.min_confidence,
         target_fields=args.fields,
