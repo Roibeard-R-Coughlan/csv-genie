@@ -39,7 +39,10 @@ except Exception:
 
 APOLLO_BASE_URL = "https://api.apollo.io/api/v1"
 APOLLO_API_KEY_ENV = "APOLLO_API_KEY"
+SERPAPI_API_KEY_ENV = "SERPAPI_API_KEY"
 DUCKDUCKGO_HTML_URL = "https://duckduckgo.com/html/?q={query}"
+SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
+DEFAULT_SEARCH_LOCATION = "Galway, County Galway, Ireland"
 
 DEFAULT_TIMEOUT = 10
 DIRECT_DOMAIN_TIMEOUT = 4
@@ -92,6 +95,16 @@ DIRECTORY_DOMAINS = {
     "kompass.com",
     "tuugo.info",
     "bizireland.com",
+    "cybo.com",
+    "odycy.com",
+    "phonebook.ie",
+    "reviewbritain.com",
+    "iscp.ie",
+    "page.tl",
+    "hotfrog.ie",
+    "yelu.ie",
+    "ie.near-place.com",
+    "ireland724.info",
 }
 
 SUSPICIOUS_PHONE_REASONS = {
@@ -397,6 +410,126 @@ def ddg_search(query: str, max_results: int = 8) -> List[SearchResult]:
     return results
 
 
+def serpapi_search(
+    query: str,
+    max_results: int = 8,
+    api_key: Optional[str] = None,
+    search_location: str = DEFAULT_SEARCH_LOCATION,
+) -> List[SearchResult]:
+    """Search Google through SerpAPI when a key is available.
+
+    SerpAPI is better than scraped DuckDuckGo for exact local-business queries,
+    e.g. cases where Google finds the official site but DDG returns directories.
+    """
+    key = api_key or os.getenv(SERPAPI_API_KEY_ENV)
+    if not key:
+        return [SearchResult(title="SEARCH_ERROR", url="", snippet="SERPAPI_API_KEY missing")]
+    params = {
+        "engine": "google",
+        "q": query,
+        "google_domain": "google.ie",
+        "gl": "ie",
+        "hl": "en",
+        "location": search_location or DEFAULT_SEARCH_LOCATION,
+        "num": max_results,
+        "api_key": key,
+    }
+    try:
+        response = requests.get(SERPAPI_SEARCH_URL, params=params, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        return [SearchResult(title="SEARCH_ERROR", url="", snippet=str(exc))]
+
+    results: List[SearchResult] = []
+    for item in (data.get("organic_results") or [])[:max_results]:
+        url = item.get("link") or ""
+        title = item.get("title") or ""
+        snippet = item.get("snippet") or item.get("rich_snippet", {}).get("top", {}).get("detected_extensions", "")
+        if isinstance(snippet, dict):
+            snippet = " ".join(str(v) for v in snippet.values())
+        if url:
+            results.append(SearchResult(title=title, url=url, snippet=str(snippet or "")))
+    # Include local place result if present because it often contains the official website/phone.
+    place = data.get("local_results", {}) or {}
+    places = place.get("places") or []
+    for item in places[: max(0, max_results - len(results))]:
+        url = item.get("website") or item.get("link") or ""
+        title = item.get("title") or ""
+        snippet = " ".join(str(item.get(k, "")) for k in ["address", "phone", "type"] if item.get(k))
+        if url:
+            results.append(SearchResult(title=title, url=url, snippet=snippet))
+    return results
+
+
+def search_web(
+    query: str,
+    max_results: int = 8,
+    *,
+    provider: str = "duckduckgo",
+    serpapi_api_key: Optional[str] = None,
+    search_location: str = DEFAULT_SEARCH_LOCATION,
+) -> List[SearchResult]:
+    provider = (provider or "duckduckgo").lower().strip()
+    if provider in {"serpapi", "google", "google_serpapi"}:
+        results = serpapi_search(query, max_results=max_results, api_key=serpapi_api_key, search_location=search_location)
+        # If the paid provider is unavailable, fall back to the free provider instead of failing the row.
+        if len(results) == 1 and results[0].title == "SEARCH_ERROR":
+            fallback = ddg_search(query, max_results=max_results)
+            if fallback:
+                fallback[0].snippet = f"SerpAPI unavailable ({results[0].snippet[:80]}). Fallback used. " + fallback[0].snippet
+            return fallback
+        return results
+    return ddg_search(query, max_results=max_results)
+
+
+def inferred_names_from_directory_result(result: SearchResult, company_name: str, area: str) -> List[str]:
+    """Infer possible trading names from directory URLs/titles for rescue searches.
+
+    Example: a directory result for Ballinasloe Physiotherapy may have a slug
+    like /action-physio-ballinasloe. This extracts "action physio" and lets
+    the tool check actionphysio.ie instead of accepting the directory page.
+    """
+    domain = get_domain(result.url)
+    if not is_directory_domain(domain):
+        return []
+
+    parsed = urllib.parse.urlparse(result.url)
+    candidates: List[str] = []
+    parts_to_check = [parsed.path.replace("/", " "), result.title]
+    area_tokens = set(normalize_text(area or "").split()) | {"galway", "ireland", "ie", "biz", "business", "clinic", "clinics", "contact"}
+    generic = set(company_tokens(company_name)) | {"physiotherapy", "physio", "therapy", "injury", "sports"}
+
+    for raw in parts_to_check:
+        words = [w for w in normalize_text(raw).split() if len(w) >= 3 and w not in area_tokens]
+        # Keep meaningful chunks around physio/therapy names, but remove directory noise.
+        cleaned = [w for w in words if w not in {"cybo", "odycy", "providers", "provider", "page", "reviews"}]
+        if not cleaned:
+            continue
+        # Prefer two/three-word names that include a physiotherapy-related token or differ from the original row.
+        for i in range(0, max(1, len(cleaned) - 1)):
+            phrase_words = cleaned[i : i + 3]
+            if len(phrase_words) < 2:
+                continue
+            phrase = " ".join(phrase_words)
+            phrase_norm = normalize_text(phrase)
+            if phrase_norm == normalize_text(company_name):
+                continue
+            if any(w in {"physio", "physiotherapy", "therapy"} for w in phrase_words) or not set(phrase_words).issubset(generic):
+                candidates.append(phrase)
+
+    # Clean and dedupe; keep short trading-name variants only.
+    deduped: List[str] = []
+    for candidate in candidates:
+        words = [w for w in normalize_text(candidate).split() if w not in area_tokens]
+        if len(words) < 2 or len(words) > 4:
+            continue
+        candidate = " ".join(words)
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped[:2]
+
+
 def fetch_page(url: str, *, timeout: Optional[float] = None) -> Tuple[Optional[str], Optional[str]]:
     headers = {"User-Agent": USER_AGENT}
     request_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
@@ -672,11 +805,19 @@ def score_apollo_match(org: Dict[str, Any], company_name: str, area: str) -> flo
 def build_queries(company_name: str, area: str, category: str = "") -> List[str]:
     area = clean_cell(area) or "Galway Ireland"
     category = clean_cell(category) or ""
-    return [
-        f'"{company_name}" "{area}" official website phone',
-        f'"{company_name}" Galway Ireland contact',
-        f'{company_name} {area} {category} website phone',
+    # Keep queries close to how a person would Google local SMEs.
+    # Exact-name/location queries work better than broad keyword-heavy searches
+    # and reduce directory pages outranking official websites.
+    queries = [
+        f'"{company_name}" "{area}"',
+        f'"{company_name}" "{area}" contact',
+        f'"{company_name}" Galway',
+        f'"{company_name}" official website',
+        f'"{company_name}" email phone',
     ]
+    if category:
+        queries.append(f'"{company_name}" "{area}" {category}')
+    return queries
 
 
 def enrich_row(
@@ -686,6 +827,9 @@ def enrich_row(
     apollo_api_key: Optional[str] = None,
     delay: float = 0.0,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
+    search_provider: str = "duckduckgo",
+    serpapi_api_key: Optional[str] = None,
+    search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> RowProposal:
     company_name = clean_cell(row.get("Company Name")) or ""
     area = clean_cell(row.get("Area")) or "Galway Ireland"
@@ -723,10 +867,21 @@ def enrich_row(
 
     urls_to_check: List[str] = []
 
-    # Use existing website as source for phone/email if it exists.
+    # Use existing website as source for phone/email if it exists, but do not
+    # automatically trust directory/free-hosting pages as official websites.
     if existing_website:
         urls_to_check.extend(candidate_contact_urls(existing_website))
-        proposal.website.update_if_better(existing_website, existing_website, 1.0, "Existing CRM website")
+        if is_directory_domain(get_domain(existing_website)):
+            proposal.add_candidate(
+                "Website",
+                existing_website,
+                existing_website,
+                0.65,
+                "Existing CRM website is a directory/free-hosting/listing page - manual review",
+            )
+            proposal.notes.append("Existing website looks like a directory/free-hosting page; not treated as verified official site")
+        else:
+            proposal.website.update_if_better(existing_website, existing_website, 1.0, "Existing CRM website")
 
     # v3 fallback: direct likely-domain checks. This catches SMEs that search
     # engines do not return reliably, while still keeping values in audit review.
@@ -738,6 +893,8 @@ def enrich_row(
             if not html:
                 continue
             source_url = root_url(final_url or guess_url)
+            if is_directory_domain(get_domain(source_url)):
+                continue
             confidence, reason = score_page_match(source_url, html, company_name, area)
             if confidence >= 0.50:
                 proposal.add_candidate("Website", source_url, source_url, confidence, reason)
@@ -759,15 +916,17 @@ def enrich_row(
                         key=lambda e: (not e.startswith(("info@", "contact@", "hello@", "admin@", "reception@")), e),
                     )[0]
                     email_conf = min(0.86, confidence + 0.03)
-                    proposal.add_candidate("Email", preferred, source_url, email_conf, "Email found on direct domain candidate")
-                    proposal.email.update_if_better(preferred, source_url, email_conf, "Email found on direct domain candidate")
+                    proposal.add_candidate("Email", preferred, source_url, email_conf, "Email found on direct domain candidate - manual check unless website is verified")
+                    if proposal.website.value and is_official_phone_source(source_url, proposal.website.value):
+                        proposal.email.update_if_better(preferred, source_url, email_conf, "Email found on verified direct domain")
 
     # Search for official website and possible snippets.
+    rescue_names: List[str] = []
     if not existing_website or "phone" in targets or "email" in targets:
         for query in build_queries(company_name, area, category):
             if delay:
                 time.sleep(delay)
-            results = ddg_search(query, max_results=8)
+            results = search_web(query, max_results=8, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
             if len(results) == 1 and results[0].title == "SEARCH_ERROR":
                 proposal.notes.append(f"Search error: {results[0].snippet[:120]}")
                 continue
@@ -780,6 +939,9 @@ def enrich_row(
                 candidate_confidence, candidate_reason = score_candidate_search_result(result, company_name, area)
                 if "website" in targets and candidate_confidence >= 0.35:
                     proposal.add_candidate("Website", result.url, result.url, candidate_confidence, candidate_reason)
+                    for inferred_name in inferred_names_from_directory_result(result, company_name, area):
+                        if inferred_name not in rescue_names:
+                            rescue_names.append(inferred_name)
 
                 ok, confidence, note = is_probably_official_result(result, company_name, area)
                 if ok and "website" in targets:
@@ -792,6 +954,42 @@ def enrich_row(
                     if phones:
                         snippet_conf = 0.65 if is_directory_domain(get_domain(result.url)) else min(max(confidence, candidate_confidence), 0.75)
                         proposal.add_candidate("Phone", phones[0], result.url, snippet_conf, "Phone from search result snippet - manual check only")
+
+
+    # Rescue pass: if a directory result exposes a likely trading name, try direct domains/searches for that name.
+    # This handles rows where the CRM name is generic or slightly wrong, e.g.
+    # "Ballinasloe Physiotherapy" appearing in directories as "Action Physio Ballinasloe".
+    for rescue_name in rescue_names[:2]:
+        if delay:
+            time.sleep(delay)
+        for guess_url in guessed_website_urls(rescue_name)[:4]:
+            html, final_url = fetch_page(guess_url, timeout=DIRECT_DOMAIN_TIMEOUT)
+            if not html:
+                continue
+            source_url = root_url(final_url or guess_url)
+            if is_directory_domain(get_domain(source_url)):
+                continue
+            confidence, reason = score_page_match(source_url, html, rescue_name, area)
+            reason = f"Rescue search from directory trading name '{rescue_name}'; {reason}"
+            if confidence >= 0.50:
+                proposal.add_candidate("Website", source_url, source_url, min(confidence, 0.88), reason)
+                urls_to_check.extend(candidate_contact_urls(source_url))
+            if confidence >= 0.78 and "website" in targets:
+                proposal.website.update_if_better(source_url, source_url, min(confidence, 0.90), reason)
+
+        rescue_query = f'"{rescue_name}" "{area}" official website contact'
+        rescue_results = search_web(rescue_query, max_results=5, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
+        for result in rescue_results:
+            if not result.url:
+                continue
+            candidate_confidence, candidate_reason = score_candidate_search_result(result, rescue_name, area)
+            candidate_reason = f"Rescue search from directory trading name '{rescue_name}'; {candidate_reason}"
+            if "website" in targets and candidate_confidence >= 0.35:
+                proposal.add_candidate("Website", result.url, result.url, candidate_confidence, candidate_reason)
+            ok, confidence, note = is_probably_official_result(result, rescue_name, area)
+            if ok and "website" in targets:
+                proposal.website.update_if_better(result.url, result.url, min(confidence, 0.90), f"Rescue search: {note}")
+                urls_to_check.extend(candidate_contact_urls(result.url))
 
     # If Apollo/search/domain fallback found a proposed website, scrape it for phone/email.
     if proposal.website.value:
@@ -829,9 +1027,13 @@ def enrich_row(
                     emails,
                     key=lambda e: (not e.startswith(("info@", "contact@", "hello@", "admin@", "reception@")), e),
                 )[0]
-                conf = 0.85 if proposal.website.confidence >= 0.80 or existing_website else 0.70
-                proposal.add_candidate("Email", preferred, source, conf, "Email found on website/contact page")
-                proposal.email.update_if_better(preferred, source, conf, "Email found on website/contact page")
+                official_source = proposal.website.value or existing_website
+                is_verified_source = is_official_phone_source(source, official_source)
+                conf = 0.85 if is_verified_source and (proposal.website.confidence >= 0.80 or existing_website) else 0.65
+                reason = "Email found on proposed/existing official website contact page" if is_verified_source else "Email found on non-official candidate page - manual check only"
+                proposal.add_candidate("Email", preferred, source, conf, reason)
+                if is_verified_source:
+                    proposal.email.update_if_better(preferred, source, conf, reason)
 
     if not any([proposal.website.value, proposal.phone.value, proposal.email.value]):
         if proposal.candidates:
@@ -928,6 +1130,9 @@ def enrich_dataframe(
     apollo_api_key: Optional[str] = None,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    search_provider: str = "duckduckgo",
+    serpapi_api_key: Optional[str] = None,
+    search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> pd.DataFrame:
     """
     Enrich a dataframe and return original rows plus audit/proposal columns.
@@ -971,6 +1176,9 @@ def enrich_dataframe(
                 apollo_api_key=apollo_api_key,
                 delay=delay,
                 target_fields=target_fields,
+                search_provider=search_provider,
+                serpapi_api_key=serpapi_api_key,
+                search_location=search_location,
             )
         except Exception as exc:
             proposal = RowProposal()
@@ -1017,8 +1225,11 @@ def enrich_csv(
     min_confidence: float = 0.80,
     apollo_api_key: Optional[str] = None,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
+    search_provider: str = "duckduckgo",
+    serpapi_api_key: Optional[str] = None,
+    search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> None:
-    df = pd.read_csv(input_file)
+    df = pd.read_csv(input_file, dtype=str, keep_default_na=False)
     api_key = apollo_api_key or os.getenv(APOLLO_API_KEY_ENV)
     enriched = enrich_dataframe(
         df,
@@ -1029,6 +1240,9 @@ def enrich_csv(
         use_apollo=not skip_apollo,
         apollo_api_key=api_key,
         target_fields=target_fields,
+        search_provider=search_provider,
+        serpapi_api_key=serpapi_api_key,
+        search_location=search_location,
     )
     enriched.to_csv(output_file, index=False)
     print(f"Enrichment completed. Output written to {output_file}")
@@ -1041,6 +1255,9 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=0.0, help="Optional delay between network requests in seconds")
     parser.add_argument("--limit", type=int, default=5, help="Only research the first N incomplete rows while preserving all rows")
     parser.add_argument("--use-apollo", action="store_true", help="Use Apollo if APOLLO_API_KEY is available")
+    parser.add_argument("--search-provider", choices=["duckduckgo", "serpapi"], default="duckduckgo", help="Search backend for web discovery")
+    parser.add_argument("--serpapi-key", default=None, help="Optional SerpAPI key; otherwise SERPAPI_API_KEY env var is used")
+    parser.add_argument("--search-location", default=DEFAULT_SEARCH_LOCATION, help="Location bias for SerpAPI/Google local results")
     parser.add_argument("--mode", choices=["preview", "verified_only"], default="preview", help="preview keeps fields unchanged; verified_only fills high-confidence blanks")
     parser.add_argument("--min-confidence", type=float, default=0.80, help="Minimum confidence required for verified_only fill")
     parser.add_argument("--fields", nargs="+", default=["Website", "Phone", "Email"], help="Fields to research, e.g. Website Phone Email")
@@ -1055,6 +1272,9 @@ def main() -> None:
         mode=args.mode,
         min_confidence=args.min_confidence,
         target_fields=args.fields,
+        search_provider=args.search_provider,
+        serpapi_api_key=args.serpapi_key or os.getenv(SERPAPI_API_KEY_ENV),
+        search_location=args.search_location,
     )
 
 

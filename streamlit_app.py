@@ -7,6 +7,7 @@ Run locally with:
 
 from __future__ import annotations
 
+import csv
 import os
 
 import pandas as pd
@@ -14,6 +15,7 @@ import streamlit as st
 
 from crm_enrichment_tool import (
     AUDIT_COLUMNS,
+    DEFAULT_SEARCH_LOCATION,
     audit_columns_only,
     crm_import_columns_only,
     enrich_dataframe,
@@ -97,6 +99,35 @@ with st.sidebar:
         help="Shows possible matches even when they are not verified enough to auto-fill CRM fields.",
     )
 
+    st.subheader("Search provider")
+    search_provider_label = st.selectbox(
+        "Web search backend",
+        [
+            "DuckDuckGo fallback - free",
+            "SerpAPI Google results - recommended for local businesses",
+        ],
+        index=0,
+        help="SerpAPI usually matches Google results better for local business lookups. DuckDuckGo is free but less consistent.",
+    )
+    search_provider = "serpapi" if search_provider_label.startswith("SerpAPI") else "duckduckgo"
+    serpapi_key_input = st.text_input(
+        "SerpAPI key for this session only",
+        type="password",
+        value="",
+        help="Optional. Leave blank to use SERPAPI_API_KEY from .env or environment variables.",
+    )
+    serpapi_env_key_exists = bool(os.getenv("SERPAPI_API_KEY"))
+    if serpapi_env_key_exists:
+        st.caption("SERPAPI_API_KEY found in environment/.env")
+    else:
+        st.caption("No SERPAPI_API_KEY found. SerpAPI will fall back to DuckDuckGo unless you paste a key above.")
+
+    search_location = st.text_input(
+        "Search location bias",
+        value=DEFAULT_SEARCH_LOCATION,
+        help="Used by SerpAPI/Google. Keep this local, e.g. Galway, County Galway, Ireland, to reduce irrelevant directory results.",
+    )
+
     st.subheader("Apollo")
     use_apollo = st.checkbox(
         "Use Apollo API",
@@ -125,6 +156,8 @@ def build_run_settings(
     delay: float,
     use_apollo_effective: bool,
     target_fields: list[str],
+    search_provider: str,
+    search_location: str,
 ) -> dict:
     """Settings that affect the actual enrichment result.
 
@@ -139,6 +172,8 @@ def build_run_settings(
         "delay_seconds": round(float(delay), 2),
         "apollo_enabled_for_run": bool(use_apollo_effective),
         "fields_to_research": list(target_fields),
+        "search_provider": search_provider,
+        "search_location": search_location or DEFAULT_SEARCH_LOCATION,
     }
 
 
@@ -150,6 +185,10 @@ def settings_changed(current: dict, previous: dict | None) -> bool:
 
 uploaded_file = st.file_uploader("Upload a CRM import CSV", type=["csv"])
 
+current_effective_search_provider = search_provider
+if search_provider == "serpapi" and not (serpapi_key_input.strip() or os.getenv("SERPAPI_API_KEY")):
+    current_effective_search_provider = "duckduckgo"
+
 current_run_settings = build_run_settings(
     file_name=uploaded_file.name if uploaded_file is not None else None,
     mode=mode,
@@ -158,11 +197,13 @@ current_run_settings = build_run_settings(
     delay=float(delay),
     use_apollo_effective=bool(use_apollo and (apollo_key_input.strip() or os.getenv("APOLLO_API_KEY"))),
     target_fields=target_fields,
+    search_provider=current_effective_search_provider,
+    search_location=search_location,
 )
 
 st.info(
-    "Recommended test: Preview only, 10 rows, 1.00s delay, Apollo off, Website + Phone only. "
-    "Use the audit CSV for review. Use the CRM import CSV only after verified-only mode shows good changes."
+    "Recommended test: Preview only, 10 rows, 1.00s delay, Apollo off, Website first. "
+    "Use SerpAPI when you want Google-like local-business search results. Keep Search location bias set to Galway, County Galway, Ireland. Use the audit CSV for review."
 )
 st.caption(
     "If a 25-row run seems to stall, watch the progress line after clicking Run research. "
@@ -197,7 +238,7 @@ def build_visible_audit(audit_df: pd.DataFrame, *, review_rows_only: bool, candi
 
 
 if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
+    df = pd.read_csv(uploaded_file, dtype=str, keep_default_na=False)
 
     st.subheader("Uploaded file preview")
     st.dataframe(df.head(10), use_container_width=True)
@@ -215,12 +256,25 @@ if uploaded_file is not None:
     with col3:
         st.metric("Missing emails", int(is_blank_series(df["Email"]).sum()))
 
+    selected_missing = 0
+    for field in target_fields:
+        if field in df.columns:
+            selected_missing += int(is_blank_series(df[field]).sum())
+    if selected_missing and int(row_limit) > selected_missing:
+        st.info(f"Only {selected_missing} blank selected fields are currently available to research. A lower row limit may be faster.")
+
     if not target_fields:
         st.warning("Select at least one field to research.")
         st.stop()
 
     if st.button("Run research", type="primary"):
         api_key = apollo_key_input.strip() or os.getenv("APOLLO_API_KEY")
+        serpapi_key = serpapi_key_input.strip() or os.getenv("SERPAPI_API_KEY")
+        effective_search_provider = search_provider
+        if search_provider == "serpapi" and not serpapi_key:
+            st.warning("SerpAPI is selected but no key is available. Falling back to DuckDuckGo for this run.")
+            effective_search_provider = "duckduckgo"
+
         if use_apollo and not api_key:
             st.warning("Apollo is enabled but no API key is available. Apollo will be skipped for this run.")
             use_apollo_effective = False
@@ -249,6 +303,9 @@ if uploaded_file is not None:
                 apollo_api_key=api_key,
                 target_fields=target_fields,
                 progress_callback=update_progress,
+                search_provider=effective_search_provider,
+                serpapi_api_key=serpapi_key,
+                search_location=search_location,
             )
         progress_bar.progress(1.0, text="Research completed.")
         status_box.empty()
@@ -264,6 +321,8 @@ if uploaded_file is not None:
             delay=float(delay),
             use_apollo_effective=use_apollo_effective,
             target_fields=target_fields,
+            search_provider=effective_search_provider,
+            search_location=search_location,
         )
         st.success("Research completed.")
 
@@ -315,7 +374,7 @@ if st.session_state.result_df is not None:
     st.subheader("Download")
     st.download_button(
         "Download audit CSV for review - not for CRM import",
-        data=audit_df.to_csv(index=False).encode("utf-8"),
+        data=audit_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
         file_name="csv_genie_audit.csv",
         disabled=is_stale_result,
         mime="text/csv",
@@ -326,7 +385,7 @@ if st.session_state.result_df is not None:
         st.warning("Preview mode keeps CRM fields unchanged. The audit CSV is the useful file at this stage; the CRM import CSV is disabled to avoid importing unchanged data by mistake.")
         st.download_button(
             "Download CRM import CSV - disabled in Preview mode",
-            data=final_import_df.to_csv(index=False).encode("utf-8"),
+            data=final_import_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
             file_name="csv_genie_crm_import_preview_unchanged.csv",
             mime="text/csv",
             disabled=True,
@@ -336,7 +395,7 @@ if st.session_state.result_df is not None:
         st.warning("Verified-only mode fills only blank fields that meet the confidence threshold. Still review the audit CSV before importing.")
         st.download_button(
             "Download CRM import CSV for website import",
-            data=final_import_df.to_csv(index=False).encode("utf-8"),
+            data=final_import_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
             file_name="csv_genie_crm_import.csv",
             mime="text/csv",
             disabled=is_stale_result,
