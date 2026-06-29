@@ -19,6 +19,30 @@ python -m streamlit run streamlit_app.py
 5. Keep **Search location bias** set to `Galway, County Galway, Ireland`.
 6. Review the audit CSV before using any CRM import export.
 
+## v4.5 changes (Strict Verification)
+
+**Major safety improvement: False verification prevention.**
+
+- Added `verify_official_website()` function enforcing 8 safety rules
+- All search/domain results are candidates first; only strict verifier promotes to verified proposals
+- Directory/forum/town sites (phonebook.ie, page.tl, ballinasloe.ie, etc.) are candidate-only
+- Generic token matches (physio, clinic, galway, west) alone are rejected
+- Result pages (/privacy-policy/, /directory/, Reddit, forum posts) stay candidate-only
+- Added "Rejected Reason" column in audit output for every candidate
+- SerpAPI fallback improved with explicit error detection
+- Phone and email are always candidates; website requires proof of official identity
+
+**Safety guarantee:** No directory or unrelated business will be verified as an official website unless:
+- The page title or visible text clearly shows the full company name or very close trading-name match
+- The domain structurally supports the business identity
+- It's not a town/general portal or result page
+
+Examples of safe rejections:
+- voicefleet.ai will NOT be verified for Marmion Sports Injury Clinic
+- foot.ie will NOT be verified for RD Athletic Therapy
+- ballinasloe.ie will NOT be verified (it's a town portal, not clinic domain)
+- Fresha/Treatwell/Yelp results will stay candidate-only
+
 ## v4.4 changes
 
 - Added SerpAPI location bias so Google-style searches are centred on Galway/Ireland.
@@ -51,3 +75,4 @@ For Streamlit reliability, keep batches small while testing:
 - Email: 2–5 rows
 
 A future background/CLI runner can save progress after every row so long runs do not depend on the browser session staying awake.
+
