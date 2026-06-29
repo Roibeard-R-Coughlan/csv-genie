@@ -149,7 +149,7 @@ CANDIDATE_AUDIT_COLUMNS = [
     f"Candidate {field_name} {candidate_no} {suffix}"
     for field_name in CANDIDATE_FIELDS
     for candidate_no in range(1, MAX_CANDIDATES_PER_FIELD + 1)
-    for suffix in ["Value", "Source URL", "Confidence", "Reason"]
+    for suffix in ["Value", "Source URL", "Confidence", "Rejected Reason"]
 ]
 
 AUDIT_COLUMNS = BASE_AUDIT_COLUMNS + CANDIDATE_AUDIT_COLUMNS
@@ -680,6 +680,91 @@ def score_page_match(url: str, html: str, company_name: str, area: str) -> Tuple
     return round(confidence, 2), "; ".join(reason_parts)
 
 
+def verify_official_website(company_name: str, area: str, candidate_url: str, page_text: str, domain: str = "") -> Tuple[bool, float, str, Optional[str]]:
+    """Strict official website verification with safety rules.
+
+    Returns (is_verified, confidence, reason, official_root_url).
+
+    Safety rules (from requirements):
+    1. Domain is not directory/forum/town/advertising/social/booking/healthcare directory
+    2. Page title, H1, contact page, or visible text has full company name OR very close trading-name match
+    3. Generic tokens alone (physio, clinic, galway, etc.) do not count as distinctive
+    4. Domain supports business identity (not unrelated)
+    5. Result pages (privacy-policy, directory pages, forum posts, Reddit) stay candidate-only
+    """
+    if not candidate_url or not domain:
+        domain = get_domain(candidate_url)
+
+    if not domain:
+        return False, 0.0, "No valid domain", None
+
+    # Rule 1: Reject directory/forum/town/social/booking domains
+    if is_directory_domain(domain):
+        return False, 0.0, "blocked directory domain", None
+
+    # Reject town/general portal domains
+    if domain in {"ballinasloe.ie", "galway.ie", "connemara.ie", "corrib.ie"}:
+        return False, 0.0, "town/general portal, not official business", None
+
+    # Rule 5: Reject result pages like /privacy-policy, /directory/, /forum/, etc.
+    url_lower = candidate_url.lower()
+    result_page_indicators = ["/privacy", "/terms", "/contact-us", "/directory/", "/forum/", "reddit.com", "/post/", "/profile/"]
+    if any(indicator in url_lower for indicator in result_page_indicators):
+        return False, 0.0, "result/landing page, not official domain", None
+
+    # Rule 2: Check for company name or close trading-name match in page content
+    tokens = company_tokens(company_name)
+    if not tokens:
+        return False, 0.0, "no distinctive tokens in company name", None
+
+    haystack = normalize_text(" ".join([page_text, domain]))
+    company_phrase_normalized = normalize_text(company_name)
+
+    # Strong signal: exact company phrase match
+    phrase_hit = company_phrase_normalized in haystack
+
+    # Moderate signal: distinctive token(s) in page (not just generic)
+    token_hits = sum(1 for token in tokens if token in haystack)
+    has_distinctive_match = token_hits >= len(tokens) * 0.5  # At least 50% of distinctive tokens
+
+    # Rule 3: Generic-token-only rejection
+    # If all matches are generic words, reject
+    if not phrase_hit and token_hits == 0:
+        return False, 0.0, "generic token match only", None
+
+    # Rule 4: Domain should support business identity
+    # Check if domain contains at least one distinctive token or part of company name
+    domain_normalized = normalize_text(domain)
+    domain_has_distinctive = any(token in domain_normalized for token in tokens)
+    domain_has_company_phrase = any(word in domain_normalized for word in company_phrase_normalized.split() if len(word) >= 4)
+
+    confidence = 0.0
+    reasons = []
+
+    if phrase_hit:
+        confidence += 0.50
+        reasons.append("company phrase found on page")
+
+    if has_distinctive_match:
+        confidence += 0.25
+        reasons.append(f"{token_hits}/{len(tokens)} distinctive tokens matched")
+
+    if domain_has_distinctive or domain_has_company_phrase:
+        confidence += 0.15
+        reasons.append("domain contains company identifier")
+
+    confidence = min(confidence, 0.95)
+
+    # Must have at least one strong signal (phrase match OR distinctive match in domain + page)
+    if confidence < 0.60:
+        return False, confidence, f"weak business-name match ({'; '.join(reasons)})", None
+
+    official_root = root_url(candidate_url)
+    final_reason = "; ".join(reasons) if reasons else "verified official website"
+    return True, confidence, final_reason, official_root
+
+
+
 def extract_emails(text: str) -> List[str]:
     emails = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text or "")
     cleaned: List[str] = []
@@ -911,21 +996,30 @@ def enrich_row(
             if not html:
                 continue
             source_url = root_url(final_url or guess_url)
-            if is_directory_domain(get_domain(source_url)):
+            source_domain = get_domain(source_url)
+            if is_directory_domain(source_domain):
                 continue
             confidence, reason = score_page_match(source_url, html, company_name, area)
-            if confidence >= 0.50:
+            page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+
+            # Add as candidate first
+            if "website" in targets and confidence >= 0.50:
                 proposal.add_candidate("Website", source_url, source_url, confidence, reason)
                 urls_to_check.extend(candidate_contact_urls(source_url))
-            if confidence >= 0.78 and "website" in targets:
-                proposal.website.update_if_better(source_url, source_url, confidence, reason)
 
-            combined = html + " " + BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+            # Strict verification before promoting to verified proposal
+            is_verified, verified_confidence, verified_reason, official_url = verify_official_website(
+                company_name, area, source_url, page_text, source_domain
+            )
+            if is_verified and "website" in targets and verified_confidence >= 0.78:
+                proposal.website.update_if_better(official_url or source_url, official_url or source_url, verified_confidence, f"Verified: {verified_reason}")
+
+            combined = html + " " + page_text
             if "phone" in targets and not has_value(row.get("Phone")) and confidence >= 0.55:
                 phones = extract_irish_phones(combined)
                 if phones:
                     phone_conf = min(0.88, confidence + 0.05)
-                    proposal.add_candidate("Phone", phones[0], source_url, phone_conf, "Phone found on direct domain candidate - verified only after official-site scrape")
+                    proposal.add_candidate("Phone", phones[0], source_url, phone_conf, "Phone found on direct domain candidate - manual check")
             if "email" in targets and not has_value(row.get("Email")) and confidence >= 0.60:
                 emails = extract_emails(combined)
                 if emails:
@@ -934,9 +1028,8 @@ def enrich_row(
                         key=lambda e: (not e.startswith(("info@", "contact@", "hello@", "admin@", "reception@")), e),
                     )[0]
                     email_conf = min(0.86, confidence + 0.03)
-                    proposal.add_candidate("Email", preferred, source_url, email_conf, "Email found on direct domain candidate - manual check unless website is verified")
-                    if proposal.website.value and is_official_phone_source(source_url, proposal.website.value):
-                        proposal.email.update_if_better(preferred, source_url, email_conf, "Email found on verified direct domain")
+                    proposal.add_candidate("Email", preferred, source_url, email_conf, "Email found on direct domain candidate - manual check")
+
 
     # Search for official website and possible snippets.
     rescue_names: List[str] = []
@@ -946,7 +1039,11 @@ def enrich_row(
                 time.sleep(delay)
             results = search_web(query, max_results=8, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
             if len(results) == 1 and results[0].title == "SEARCH_ERROR":
-                proposal.notes.append(f"Search error: {results[0].snippet[:120]}")
+                error_msg = results[0].snippet[:120]
+                if "SERPAPI_API_KEY missing" in error_msg or "Quota" in error_msg or "Rate" in error_msg:
+                    proposal.notes.append(f"SerpAPI unavailable: {error_msg}. Fallback to DuckDuckGo.")
+                else:
+                    proposal.notes.append(f"Search error: {error_msg}")
                 continue
             if not results:
                 proposal.notes.append(f"No search results for query: {query[:80]}")
@@ -955,23 +1052,36 @@ def enrich_row(
                     continue
 
                 candidate_confidence, candidate_reason = score_candidate_search_result(result, company_name, area)
+                result_domain = get_domain(result.url)
+
+                # Always add as candidate if confidence >= 0.35
                 if "website" in targets and candidate_confidence >= 0.35:
                     proposal.add_candidate("Website", result.url, result.url, candidate_confidence, candidate_reason)
                     for inferred_name in inferred_names_from_directory_result(result, company_name, area):
                         if inferred_name not in rescue_names:
                             rescue_names.append(inferred_name)
 
-                ok, confidence, note = is_probably_official_result(result, company_name, area)
-                if ok and "website" in targets:
-                    proposal.website.update_if_better(result.url, result.url, confidence, note)
-                    urls_to_check.extend(candidate_contact_urls(result.url))
+                # Only verify non-directory domains with high candidate confidence
+                if not is_directory_domain(result_domain) and candidate_confidence >= 0.65 and "website" in targets:
+                    if delay:
+                        time.sleep(delay / 2)
+                    html, _ = fetch_page(result.url)
+                    if html:
+                        page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+                        is_verified, verified_confidence, verified_reason, official_url = verify_official_website(
+                            company_name, area, result.url, page_text, result_domain
+                        )
+                        if is_verified and verified_confidence >= 0.80:
+                            proposal.website.update_if_better(official_url or result.url, official_url or result.url, verified_confidence, f"Verified: {verified_reason}")
+                            urls_to_check.extend(candidate_contact_urls(official_url or result.url))
 
                 # Directory snippets can still provide phone numbers, but use lower confidence.
                 if "phone" in targets and result.snippet:
                     phones = extract_irish_phones(result.snippet)
                     if phones:
-                        snippet_conf = 0.65 if is_directory_domain(get_domain(result.url)) else min(max(confidence, candidate_confidence), 0.75)
+                        snippet_conf = 0.65 if is_directory_domain(result_domain) else min(max(candidate_confidence, 0.65), 0.75)
                         proposal.add_candidate("Phone", phones[0], result.url, snippet_conf, "Phone from search result snippet - manual check only")
+
 
 
     # Rescue pass: if a directory result exposes a likely trading name, try direct domains/searches for that name.
@@ -985,15 +1095,24 @@ def enrich_row(
             if not html:
                 continue
             source_url = root_url(final_url or guess_url)
-            if is_directory_domain(get_domain(source_url)):
+            source_domain = get_domain(source_url)
+            if is_directory_domain(source_domain):
                 continue
             confidence, reason = score_page_match(source_url, html, rescue_name, area)
+            page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
             reason = f"Rescue search from directory trading name '{rescue_name}'; {reason}"
-            if confidence >= 0.50:
+
+            # Add as candidate first
+            if "website" in targets and confidence >= 0.50:
                 proposal.add_candidate("Website", source_url, source_url, min(confidence, 0.88), reason)
                 urls_to_check.extend(candidate_contact_urls(source_url))
-            if confidence >= 0.78 and "website" in targets:
-                proposal.website.update_if_better(source_url, source_url, min(confidence, 0.90), reason)
+
+            # Strict verification for rescue candidates
+            is_verified, verified_confidence, verified_reason, official_url = verify_official_website(
+                rescue_name, area, source_url, page_text, source_domain
+            )
+            if is_verified and verified_confidence >= 0.80 and "website" in targets:
+                proposal.website.update_if_better(official_url or source_url, official_url or source_url, min(verified_confidence, 0.90), f"Rescue verified: {verified_reason}")
 
         rescue_query = f'"{rescue_name}" "{area}" official website contact'
         rescue_results = search_web(rescue_query, max_results=5, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
@@ -1004,10 +1123,22 @@ def enrich_row(
             candidate_reason = f"Rescue search from directory trading name '{rescue_name}'; {candidate_reason}"
             if "website" in targets and candidate_confidence >= 0.35:
                 proposal.add_candidate("Website", result.url, result.url, candidate_confidence, candidate_reason)
-            ok, confidence, note = is_probably_official_result(result, rescue_name, area)
-            if ok and "website" in targets:
-                proposal.website.update_if_better(result.url, result.url, min(confidence, 0.90), f"Rescue search: {note}")
-                urls_to_check.extend(candidate_contact_urls(result.url))
+
+            # Strict verification for rescue search results
+            result_domain = get_domain(result.url)
+            if not is_directory_domain(result_domain) and "website" in targets:
+                if delay:
+                    time.sleep(delay / 2)
+                html, _ = fetch_page(result.url)
+                if html:
+                    page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+                    is_verified, verified_confidence, verified_reason, official_url = verify_official_website(
+                        rescue_name, area, result.url, page_text, result_domain
+                    )
+                    if is_verified and verified_confidence >= 0.80:
+                        proposal.website.update_if_better(official_url or result.url, official_url or result.url, min(verified_confidence, 0.90), f"Rescue verified: {verified_reason}")
+                        urls_to_check.extend(candidate_contact_urls(official_url or result.url))
+
 
     # If Apollo/search/domain fallback found a proposed website, scrape it for phone/email.
     if proposal.website.value:
@@ -1096,7 +1227,7 @@ def apply_proposal_to_row(
             output.at[idx, f"Candidate {prefix} {position} Value"] = candidate.value
             output.at[idx, f"Candidate {prefix} {position} Source URL"] = candidate.source_url
             output.at[idx, f"Candidate {prefix} {position} Confidence"] = f"{candidate.confidence:.2f}"
-            output.at[idx, f"Candidate {prefix} {position} Reason"] = candidate.reason
+            output.at[idx, f"Candidate {prefix} {position} Rejected Reason"] = candidate.reason
 
     write_audit("Website", proposal.website)
     write_audit("Phone", proposal.phone)
