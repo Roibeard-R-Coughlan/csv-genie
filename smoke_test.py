@@ -12,6 +12,7 @@ Never calls SerpAPI or Apollo. Uses DuckDuckGo for all free testing.
 import argparse
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -34,7 +35,10 @@ def count_results(df: pd.DataFrame) -> dict:
         "verified_emails": 0,
         "email_candidates": 0,
         "rejected_directory_results": 0,
+        "duckduckgo_errors": 0,
+        "duckduckgo_403": 0,
         "uncertain_rows": 0,
+        "skipped_row_limit": 0,
     }
 
     for idx, row in df.iterrows():
@@ -76,11 +80,89 @@ def count_results(df: pd.DataFrame) -> dict:
             for i in range(1, 4)
         ])
         has_notes = clean_cell(row.get("Enrichment Notes"))
+        skipped_due_limit = (has_notes or "").strip().lower() == "not researched due to row limit"
+        if skipped_due_limit:
+            counts["skipped_row_limit"] += 1
+        notes_text = (has_notes or "").lower()
+        decision_text = (clean_cell(row.get("Decision Needed")) or "").lower()
+        if "duckduckgo" in notes_text and ("error" in notes_text or "blocked" in notes_text):
+            counts["duckduckgo_errors"] += 1
+        if "duckduckgo blocked" in notes_text or "duckduckgo blocked" in decision_text or "403" in notes_text:
+            counts["duckduckgo_403"] += 1
 
-        if not has_proposal and (has_candidates or has_notes):
+        decision = clean_cell(row.get("Decision Needed")) or ""
+        if (
+            not skipped_due_limit
+            and not has_proposal
+            and (
+                has_candidates
+                or decision in {
+                    "Manual review: strong candidate but not verified",
+                    "Manual review: weak candidate only",
+                    "No reliable candidate found",
+                    "DuckDuckGo blocked / 403",
+                }
+            )
+        ):
             counts["uncertain_rows"] += 1
 
     return counts
+
+
+def print_rows(df: pd.DataFrame, title: str, rows: list[tuple[str, str, str]]) -> None:
+    print(f"\n{title}")
+    if not rows:
+        print("  (none)")
+        return
+    for company, value, detail in rows:
+        print(f"  - {company}: {value} {detail}".rstrip())
+
+
+def collect_report_rows(df: pd.DataFrame) -> dict:
+    verified = []
+    strong_candidates = []
+    rejected_directories = []
+    uncertain = []
+
+    for _, row in df.iterrows():
+        company = clean_cell(row.get("Company Name")) or "(unknown company)"
+        proposed = clean_cell(row.get("Proposed Website"))
+        if proposed:
+            confidence = clean_cell(row.get("Website Confidence")) or ""
+            verified.append((company, proposed, f"(confidence {confidence})" if confidence else ""))
+
+        best = clean_cell(row.get("Best Candidate Website"))
+        best_conf_raw = clean_cell(row.get("Best Candidate Confidence"))
+        try:
+            best_conf = float(best_conf_raw or 0)
+        except ValueError:
+            best_conf = 0.0
+        if best and not proposed and best_conf >= 0.65 and not is_directory_domain(get_domain(best)):
+            reason = clean_cell(row.get("Best Candidate Rejected Reason")) or ""
+            strong_candidates.append((company, best, f"(confidence {best_conf:.2f}; {reason})"))
+
+        for i in range(1, 4):
+            candidate = clean_cell(row.get(f"Candidate Website {i} Value"))
+            if not candidate:
+                continue
+            domain = get_domain(candidate)
+            if is_directory_domain(domain):
+                reason = clean_cell(row.get(f"Candidate Website {i} Rejected Reason")) or ""
+                rejected_directories.append((company, candidate, f"({reason})" if reason else ""))
+
+        decision = clean_cell(row.get("Decision Needed")) or ""
+        notes = clean_cell(row.get("Enrichment Notes")) or ""
+        if notes.strip().lower() == "not researched due to row limit":
+            continue
+        if decision and decision not in {"Existing website already present", "Verified proposal available"}:
+            uncertain.append((company, decision, f"- {notes}" if notes else ""))
+
+    return {
+        "verified": verified,
+        "strong_candidates": strong_candidates,
+        "rejected_directories": rejected_directories,
+        "uncertain": uncertain,
+    }
 
 
 def main() -> None:
@@ -163,8 +245,10 @@ def main() -> None:
         search_location="Galway, County Galway, Ireland",
     )
 
-    # Write output
-    output_file = output_dir / "smoke_test_results.csv"
+    # Write output without touching the original CSV.
+    input_stem = Path(args.input).stem
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"smoke_test_{input_stem}_{timestamp}.csv"
     result_df.to_csv(output_file, index=False)
     print(f"Results written to: {output_file}\n")
 
@@ -177,12 +261,21 @@ def main() -> None:
     print(f"Verified Websites:       {counts['verified_websites']}")
     print(f"Website Candidates:      {counts['website_candidates']}")
     print(f"Rejected Directories:    {counts['rejected_directory_results']}")
+    print(f"DuckDuckGo Errors:       {counts['duckduckgo_errors']}")
+    print(f"DuckDuckGo 403/Blocked:  {counts['duckduckgo_403']}")
     print(f"Verified Phones:         {counts['verified_phones']}")
     print(f"Phone Candidates:        {counts['phone_candidates']}")
     print(f"Verified Emails:         {counts['verified_emails']}")
     print(f"Email Candidates:        {counts['email_candidates']}")
     print(f"Uncertain Rows:          {counts['uncertain_rows']}")
+    print(f"Skipped Row Limit:       {counts['skipped_row_limit']}")
     print("=" * 60)
+
+    report_rows = collect_report_rows(result_df)
+    print_rows(result_df, "Verified websites", report_rows["verified"])
+    print_rows(result_df, "Strong candidates", report_rows["strong_candidates"])
+    print_rows(result_df, "Rejected directory results", report_rows["rejected_directories"])
+    print_rows(result_df, "Uncertain rows", report_rows["uncertain"])
 
     # Verify safety constraints
     print("\nSafety Checks:")

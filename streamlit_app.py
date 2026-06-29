@@ -207,6 +207,8 @@ def build_visible_audit(audit_df: pd.DataFrame, *, review_rows_only: bool, candi
             for col in visible.columns
             if col.startswith("Proposed ")
             or col.startswith("Candidate ")
+            or col.startswith("Best Candidate ")
+            or col == "Decision Needed"
             or col == "Enrichment Notes"
         ]
         if signal_cols:
@@ -325,6 +327,10 @@ if st.session_state.result_df is not None:
     )
 
     proposed_website_count = 0 if "Proposed Website" not in audit_df.columns else int((~is_blank_series(audit_df["Proposed Website"])).sum())
+    strong_candidate_count = 0
+    if "Best Candidate Confidence" in audit_df.columns:
+        best_conf = pd.to_numeric(audit_df["Best Candidate Confidence"], errors="coerce").fillna(0)
+        strong_candidate_count = int(((best_conf >= 0.65) & is_blank_series(audit_df.get("Proposed Website", pd.Series("", index=audit_df.index)))).sum())
     candidate_website_count = int(
         sum((~is_blank_series(audit_df[col])).sum() for col in audit_df.columns if col.startswith("Candidate Website") and col.endswith("Value"))
     )
@@ -333,10 +339,11 @@ if st.session_state.result_df is not None:
     )
 
     st.subheader("Audit review")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Verified website proposals", proposed_website_count)
-    c2.metric("Website candidates", candidate_website_count)
-    c3.metric("Phone candidates", candidate_phone_count)
+    c2.metric("Strong website candidates", strong_candidate_count)
+    c3.metric("Website candidates", candidate_website_count)
+    c4.metric("Phone candidates", candidate_phone_count)
 
     if visible_audit.empty:
         st.warning("No proposals, candidates or research notes are visible with the current filters. Untick the sidebar filter to show all rows.")

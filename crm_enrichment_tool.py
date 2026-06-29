@@ -46,6 +46,8 @@ DEFAULT_SEARCH_LOCATION = "Galway, County Galway, Ireland"
 
 DEFAULT_TIMEOUT = 10
 DIRECT_DOMAIN_TIMEOUT = 4
+MAX_DDG_QUERIES_PER_ROW = 3
+MAX_DIRECT_DOMAIN_GUESSES = 12
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -112,6 +114,10 @@ DIRECTORY_DOMAINS = {
     "mummypages.ie",
     "archive.org",
     "archive.today",
+    "foot.ie",
+    "boards.ie",
+    "reddit.com",
+    "voicefleet.ai",
 }
 
 SUSPICIOUS_PHONE_REASONS = {
@@ -139,6 +145,10 @@ BASE_AUDIT_COLUMNS = [
     "Proposed Email",
     "Email Source URL",
     "Email Confidence",
+    "Best Candidate Website",
+    "Best Candidate Confidence",
+    "Best Candidate Rejected Reason",
+    "Decision Needed",
     "Enrichment Notes",
 ]
 
@@ -292,6 +302,52 @@ def company_tokens(company_name: str) -> List[str]:
     return [t for t in tokens if len(t) >= 3 and t not in stop_words]
 
 
+def business_context(company_name: str, category: str = "") -> str:
+    return normalize_text(f"{company_name} {category}")
+
+
+def is_dental_business(company_name: str, category: str = "") -> bool:
+    context = business_context(company_name, category)
+    return any(term in context.split() for term in ["dental", "dentist", "dentists", "dentistry", "orthodontic"])
+
+
+def is_physio_business(company_name: str, category: str = "") -> bool:
+    context = business_context(company_name, category)
+    if is_dental_business(company_name, category):
+        return False
+    return any(term in context.split() for term in ["physio", "physiotherapy", "therapy"])
+
+
+def location_terms(area: str) -> List[str]:
+    """Return a short list of useful local search terms from a CRM area value."""
+    area_text = clean_cell(area) or "Galway Ireland"
+    normalized = normalize_text(area_text)
+    known_places = [
+        "galway",
+        "oranmore",
+        "ballinasloe",
+        "tuam",
+        "loughrea",
+        "knocknacarra",
+        "salthill",
+        "woodquay",
+        "barna",
+        "claregalway",
+        "athenry",
+        "clifden",
+        "oughterard",
+        "headford",
+    ]
+    terms = [place for place in known_places if place in normalized]
+    if "galway" not in terms and ("county galway" in normalized or "galway" in normalized):
+        terms.append("galway")
+    if not terms:
+        terms = [part for part in normalized.split() if len(part) >= 4 and part not in {"county", "ireland", "city"}][:2]
+    if "galway" not in terms:
+        terms.append("galway")
+    return terms[:3]
+
+
 def get_domain(url: str) -> str:
     try:
         parsed = urllib.parse.urlparse(url)
@@ -398,11 +454,22 @@ def ddg_search(query: str, max_results: int = 8) -> List[SearchResult]:
     headers = {"User-Agent": USER_AGENT}
     try:
         response = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+        if response.status_code in {403, 429}:
+            return [
+                SearchResult(
+                    title="SEARCH_ERROR",
+                    url="",
+                    snippet=f"DuckDuckGo blocked / {response.status_code} rate-limit response",
+                )
+            ]
         response.raise_for_status()
     except Exception as exc:
-        return [SearchResult(title="SEARCH_ERROR", url="", snippet=str(exc))]
+        return [SearchResult(title="SEARCH_ERROR", url="", snippet=f"DuckDuckGo error: {exc}")]
 
     soup = BeautifulSoup(response.text, "html.parser")
+    page_text = normalize_text(soup.get_text(" ", strip=True)[:3000])
+    if any(marker in page_text for marker in ["unusual traffic", "captcha", "anomaly detected"]):
+        return [SearchResult(title="SEARCH_ERROR", url="", snippet="DuckDuckGo blocked / challenge page")]
     results: List[SearchResult] = []
     for result in soup.select("div.result")[:max_results]:
         link = result.select_one("a.result__a")
@@ -415,6 +482,15 @@ def ddg_search(query: str, max_results: int = 8) -> List[SearchResult]:
         if href:
             results.append(SearchResult(title=title, url=href, snippet=snippet_text))
     return results
+
+
+def is_search_error(results: List[SearchResult]) -> bool:
+    return len(results) == 1 and results[0].title == "SEARCH_ERROR"
+
+
+def is_duckduckgo_blocked(message: str) -> bool:
+    text = message.lower()
+    return "duckduckgo blocked" in text or "403" in text or "429" in text or "rate-limit" in text
 
 
 def serpapi_search(
@@ -575,7 +651,7 @@ def root_url(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def domain_guess_slugs(company_name: str) -> List[str]:
+def domain_guess_slugs(company_name: str, category: str = "") -> List[str]:
     """Generate conservative domain slugs from a company name.
 
     This is used only as a fallback for candidate review. It helps with local
@@ -586,8 +662,6 @@ def domain_guess_slugs(company_name: str) -> List[str]:
         "the",
         "and",
         "of",
-        "galway",
-        "ireland",
         "ltd",
         "limited",
         "company",
@@ -599,48 +673,87 @@ def domain_guess_slugs(company_name: str) -> List[str]:
         return []
 
     full = "".join(words)
-    variants = [full]
+    hyphenated = "-".join(words)
+    base_variants = [full, hyphenated]
+    replacement_variants: List[str] = []
+
+    # Drop generic business suffixes while preserving distinctive brand/place
+    # terms such as RDent, Galway Dentists, Knocknacarra and Dental Care Ireland.
+    generic_business_words = {"clinic", "clinics", "practice", "centre", "center"}
+    without_generic = [word for word in words if word not in generic_business_words]
+    if without_generic and without_generic != words:
+        base_variants.extend(["".join(without_generic), "-".join(without_generic)])
+    without_galway_suffix = [word for word in without_generic if word not in {"galway", "city"}]
+    too_generic_location_drop = set(without_galway_suffix).issubset(
+        {"dental", "dentist", "dentists", "dentistry", "clinic", "clinics", "physio", "physiotherapy"}
+    )
+    if len(without_galway_suffix) >= 2 and without_galway_suffix != without_generic and not too_generic_location_drop:
+        base_variants.extend(["".join(without_galway_suffix), "-".join(without_galway_suffix)])
+
+    dental = is_dental_business(company_name, category)
+    physio = is_physio_business(company_name, category)
 
     # Common Irish SME naming patterns.
-    replacements = [
-        ("physiotherapy", "physio"),
-        ("physio", "physiotherapy"),
-        ("injuryclinic", "injury"),
-        ("sportsinjuryclinic", "sportsinjury"),
-    ]
+    replacements: List[Tuple[str, str]] = []
+    if physio:
+        replacements.extend(
+            [
+                ("physiotherapy", "physio"),
+                ("physio", "physiotherapy"),
+                ("injuryclinic", "injury"),
+                ("sportsinjuryclinic", "sportsinjury"),
+            ]
+        )
+    if dental:
+        replacements.extend(
+            [
+                ("dentists", "dental"),
+                ("dental", "dentist"),
+                ("dentist", "dentistry"),
+            ]
+        )
     for old, new in replacements:
         if old in full:
-            variants.append(full.replace(old, new))
+            replacement_variants.append(full.replace(old, new))
+        if old in hyphenated:
+            replacement_variants.append(hyphenated.replace(old, new))
 
     # Try removing generic trailing words but keep the full version first.
-    for generic in ["clinic", "practice", "therapy"]:
+    trailing_generics = ["clinic", "practice"]
+    if physio:
+        trailing_generics.append("therapy")
+    for generic in trailing_generics:
         if full.endswith(generic) and len(full) > len(generic) + 4:
-            variants.append(full[: -len(generic)])
+            replacement_variants.append(full[: -len(generic)])
 
-    # First distinctive word + physio/physiotherapy catches names like
-    # alliancephysiotherapy.com and barna-physio style sites.
+    # First distinctive word + category catches short local trading names
+    # without mixing healthcare categories.
     first = words[0]
     if len(first) >= 4:
-        variants.extend([f"{first}physio", f"{first}physiotherapy"])
+        if physio:
+            replacement_variants.extend([f"{first}physio", f"{first}physiotherapy", f"{first}-physio"])
+        if dental:
+            replacement_variants.extend([f"{first}dental", f"{first}dentist", f"{first}-dental"])
 
     deduped: List[str] = []
-    for variant in variants:
-        variant = re.sub(r"[^a-z0-9]", "", variant)
-        if len(variant) >= 6 and variant not in deduped:
+    for variant in base_variants + replacement_variants:
+        variant = re.sub(r"[^a-z0-9-]", "", variant).strip("-")
+        if len(variant.replace("-", "")) >= 5 and variant not in deduped:
             deduped.append(variant)
-    return deduped[:5]
+    return deduped[:6]
 
 
-def guessed_website_urls(company_name: str) -> List[str]:
+def guessed_website_urls(company_name: str, category: str = "") -> List[str]:
     """Return a short list of likely official domains to check directly."""
     urls: List[str] = []
-    for slug in domain_guess_slugs(company_name):
-        for tld in ["ie", "com"]:
+    slugs = domain_guess_slugs(company_name, category)
+    for tld in ["ie", "com"]:
+        for slug in slugs:
             urls.append(f"https://{slug}.{tld}")
             urls.append(f"https://www.{slug}.{tld}")
     # Keep this deliberately short so a 25-row test does not become slow.
     # Each direct-domain check can otherwise add several seconds when a domain does not exist.
-    return urls[:8]
+    return urls[:MAX_DIRECT_DOMAIN_GUESSES]
 
 
 def score_page_match(url: str, html: str, company_name: str, area: str) -> Tuple[float, str]:
@@ -897,30 +1010,46 @@ def score_apollo_match(org: Dict[str, Any], company_name: str, area: str) -> flo
 def build_queries(company_name: str, area: str, category: str = "") -> List[str]:
     area = clean_cell(area) or "Galway Ireland"
     category = clean_cell(category) or ""
+    places = location_terms(area)
+    primary_place = places[0] if places else "galway"
+    place_query = " ".join(dict.fromkeys(places))
 
-    # Simplify company name by removing common generic suffixes
-    simplified = company_name.lower()
-    for suffix in [" clinic", " clinics", " practice", " physiotherapy", " physio",
-                   " therapy", " ltd", " limited", " company"]:
-        if simplified.endswith(suffix):
-            simplified = company_name[:-len(suffix)]
+    dental = is_dental_business(company_name, category)
+    physio = is_physio_business(company_name, category)
+    if dental:
+        category_query = "dental dentist dentistry"
+    elif physio:
+        category_query = "physio physiotherapy"
+    else:
+        category_query = category or "official website"
+
+    simplified = company_name
+    for suffix in [
+        " clinic",
+        " clinics",
+        " practice",
+        " ltd",
+        " limited",
+        " company",
+    ]:
+        if simplified.lower().endswith(suffix):
+            simplified = simplified[: -len(suffix)].strip()
             break
 
     queries = [
+        f'"{company_name}" {place_query} {category_query}',
         f'"{company_name}" "{area}"',
-        f'"{company_name}" "{area}" contact',
-        f'"{simplified}" "{area}"' if simplified != company_name else None,
-        f'"{company_name}" Galway',
-        f'"{company_name}" official website',
-        f'"{company_name}" email phone',
+        f'"{company_name}" {primary_place} official website contact',
     ]
+    if simplified and normalize_text(simplified) != normalize_text(company_name):
+        queries.append(f'"{simplified}" {place_query} {category_query}')
 
-    # Add category-based query if available
-    if category:
-        queries.append(f'"{company_name}" "{area}" {category}')
-
-    # Remove None entries from simplified name fallback
-    return [q for q in queries if q is not None]
+    deduped: List[str] = []
+    for query in queries:
+        query = re.sub(r"\s+", " ", query).strip()
+        if query and query not in deduped:
+            deduped.append(query)
+    return deduped[:MAX_DDG_QUERIES_PER_ROW]
 
 
 def enrich_row(
@@ -989,7 +1118,7 @@ def enrich_row(
     # v3 fallback: direct likely-domain checks. This catches SMEs that search
     # engines do not return reliably, while still keeping values in audit review.
     if not existing_website and {"website", "phone", "email"} & targets:
-        for guess_url in guessed_website_urls(company_name):
+        for guess_url in guessed_website_urls(company_name, category):
             if delay:
                 time.sleep(delay)
             html, final_url = fetch_page(guess_url, timeout=DIRECT_DOMAIN_TIMEOUT)
@@ -1033,14 +1162,23 @@ def enrich_row(
 
     # Search for official website and possible snippets.
     rescue_names: List[str] = []
-    if not existing_website or "phone" in targets or "email" in targets:
+    needs_contact_search = ("phone" in targets and not has_value(row.get("Phone"))) or ("email" in targets and not has_value(row.get("Email")))
+    needs_website_search = "website" in targets and not existing_website and not proposal.website.value
+    if needs_website_search or needs_contact_search:
+        duckduckgo_blocked = False
         for query in build_queries(company_name, area, category):
+            if duckduckgo_blocked:
+                proposal.notes.append("DuckDuckGo skipped remaining queries after block/rate-limit response")
+                break
             if delay:
                 time.sleep(delay)
-            results = search_web(query, max_results=8, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
-            if len(results) == 1 and results[0].title == "SEARCH_ERROR":
+            results = search_web(query, max_results=6, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
+            if is_search_error(results):
                 error_msg = results[0].snippet[:120]
-                if "SERPAPI_API_KEY missing" in error_msg or "Quota" in error_msg or "Rate" in error_msg:
+                if is_duckduckgo_blocked(error_msg):
+                    proposal.notes.append(f"DuckDuckGo blocked / 403: {error_msg}")
+                    duckduckgo_blocked = True
+                elif "SERPAPI_API_KEY missing" in error_msg or "Quota" in error_msg or "Rate" in error_msg:
                     proposal.notes.append(f"SerpAPI unavailable: {error_msg}. Fallback to DuckDuckGo.")
                 else:
                     proposal.notes.append(f"Search error: {error_msg}")
@@ -1090,7 +1228,7 @@ def enrich_row(
     for rescue_name in rescue_names[:2]:
         if delay:
             time.sleep(delay)
-        for guess_url in guessed_website_urls(rescue_name)[:4]:
+        for guess_url in guessed_website_urls(rescue_name, category)[:4]:
             html, final_url = fetch_page(guess_url, timeout=DIRECT_DOMAIN_TIMEOUT)
             if not html:
                 continue
@@ -1116,6 +1254,13 @@ def enrich_row(
 
         rescue_query = f'"{rescue_name}" "{area}" official website contact'
         rescue_results = search_web(rescue_query, max_results=5, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
+        if is_search_error(rescue_results):
+            error_msg = rescue_results[0].snippet[:120]
+            if is_duckduckgo_blocked(error_msg):
+                proposal.notes.append(f"DuckDuckGo blocked / 403 during rescue search: {error_msg}")
+            else:
+                proposal.notes.append(f"Rescue search error: {error_msg}")
+            continue
         for result in rescue_results:
             if not result.url:
                 continue
@@ -1202,6 +1347,28 @@ def add_audit_columns(df: pd.DataFrame) -> pd.DataFrame:
     return output
 
 
+def choose_decision_needed(row: pd.Series, proposal: RowProposal, targets: set[str]) -> str:
+    if "website" in targets and has_value(row.get("Website")):
+        return "Existing website already present"
+    if proposal.website.value:
+        return "Verified proposal available"
+
+    notes_text = " ".join(proposal.notes).lower()
+    if "duckduckgo blocked" in notes_text or "403" in notes_text or "rate-limit" in notes_text:
+        return "DuckDuckGo blocked / 403"
+
+    best_website = proposal.top_candidates("Website", limit=1)
+    if best_website and best_website[0].confidence >= 0.65:
+        return "Manual review: strong candidate but not verified"
+    if best_website:
+        return "Manual review: weak candidate only"
+    if "website" in targets:
+        return "No reliable candidate found"
+    if proposal.candidates:
+        return "Manual review: candidate found"
+    return "No reliable candidate found"
+
+
 def apply_proposal_to_row(
     output: pd.DataFrame,
     idx: int,
@@ -1235,6 +1402,12 @@ def apply_proposal_to_row(
     write_candidates("Website")
     write_candidates("Phone")
     write_candidates("Email")
+    best_website = proposal.top_candidates("Website", limit=1)
+    if best_website:
+        output.at[idx, "Best Candidate Website"] = root_url(best_website[0].value)
+        output.at[idx, "Best Candidate Confidence"] = f"{best_website[0].confidence:.2f}"
+        output.at[idx, "Best Candidate Rejected Reason"] = best_website[0].reason
+    output.at[idx, "Decision Needed"] = choose_decision_needed(output.loc[idx], proposal, targets)
     output.at[idx, "Enrichment Notes"] = "; ".join(proposal.notes + proposal.website.notes + proposal.phone.notes + proposal.email.notes)
 
     if mode != "verified_only":
