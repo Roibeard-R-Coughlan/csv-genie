@@ -15,7 +15,7 @@ python -m streamlit run streamlit_app.py
 1. Run **Preview only** first.
 2. Use **Website only** before Phone or Email.
 3. Keep **Delay between web requests** at `1.00`.
-4. For local Galway businesses, start with **DuckDuckGo - free** and review the candidate summary columns.
+4. For local Galway businesses, use **Brave Search API - recommended** when `BRAVE_SEARCH_API_KEY` is available, with **DuckDuckGo - free** as fallback.
 5. Keep **Search location bias** set to `Galway, County Galway, Ireland`.
 6. Review the audit CSV before using any CRM import export.
 
@@ -24,10 +24,10 @@ python -m streamlit run streamlit_app.py
 Use local test CSVs only; do not commit lead files or generated outputs.
 
 ```powershell
-python smoke_test.py --input "test-inputs\dental_working_copy.csv" --rows 10 --fields Website --provider duckduckgo --delay 1.0
+python smoke_test.py --input "test-inputs\dental_working_copy.csv" --rows 5 --fields Website --provider brave --delay 1.0
 ```
 
-Smoke tests default to DuckDuckGo/free mode and save timestamped outputs in `test_outputs/`.
+Smoke tests support Brave and DuckDuckGo only, never SerpAPI/Apollo, and save timestamped outputs in `test_outputs/`.
 
 ## v4.5 changes (Strict Verification)
 
@@ -66,11 +66,12 @@ Examples of safe rejections:
 Put optional keys in `.env`:
 
 ```env
+BRAVE_SEARCH_API_KEY=your_brave_search_key_here
 SERPAPI_API_KEY=your_serpapi_key_here
 APOLLO_API_KEY=your_apollo_key_here
 ```
 
-Apollo remains off by default. SerpAPI is optional paid search and should be used only when you intentionally want Google-style paid discovery.
+Brave Search API is the recommended optional search provider. Apollo remains off by default. SerpAPI is optional paid search and should be used only when you intentionally want Google-style paid discovery.
 Do not use SerpAPI for automated smoke testing unless you explicitly intend to spend credits.
 
 ## Phone numbers and Excel

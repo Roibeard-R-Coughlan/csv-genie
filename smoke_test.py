@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Smoke test harness for CSV Genie - free provider only (DuckDuckGo).
+Smoke test harness for CSV Genie - Brave or DuckDuckGo only.
 
 Usage:
     python smoke_test.py --input test_inputs/physio.csv --rows 10 --provider duckduckgo --fields Website
+    python smoke_test.py --input test_inputs/dental.csv --rows 5 --provider brave --fields Website
     python smoke_test.py --input test_inputs/physio.csv --rows 10 --fields Website Phone
 
-Never calls SerpAPI or Apollo. Uses DuckDuckGo for all free testing.
+Never calls SerpAPI or Apollo. Brave falls back to DuckDuckGo if unavailable.
 """
 
 import argparse
@@ -18,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 
 from crm_enrichment_tool import (
+    BRAVE_SEARCH_API_KEY_ENV,
     enrich_dataframe,
     is_directory_domain,
     get_domain,
@@ -35,6 +37,8 @@ def count_results(df: pd.DataFrame) -> dict:
         "verified_emails": 0,
         "email_candidates": 0,
         "rejected_directory_results": 0,
+        "api_errors": 0,
+        "fallback_used": 0,
         "duckduckgo_errors": 0,
         "duckduckgo_403": 0,
         "uncertain_rows": 0,
@@ -85,7 +89,11 @@ def count_results(df: pd.DataFrame) -> dict:
             counts["skipped_row_limit"] += 1
         notes_text = (has_notes or "").lower()
         decision_text = (clean_cell(row.get("Decision Needed")) or "").lower()
-        if "duckduckgo" in notes_text and ("error" in notes_text or "blocked" in notes_text):
+        if "brave search api error" in notes_text or "brave search api unavailable" in notes_text or "brave_search_api_key missing" in notes_text:
+            counts["api_errors"] += 1
+        if "fallback used" in notes_text or "duckduckgo fallback used" in notes_text:
+            counts["fallback_used"] += 1
+        if "duckduckgo error" in notes_text or "duckduckgo blocked" in notes_text:
             counts["duckduckgo_errors"] += 1
         if "duckduckgo blocked" in notes_text or "duckduckgo blocked" in decision_text or "403" in notes_text:
             counts["duckduckgo_403"] += 1
@@ -167,7 +175,7 @@ def collect_report_rows(df: pd.DataFrame) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Free smoke test for CSV Genie using DuckDuckGo only."
+        description="Smoke test for CSV Genie using Brave or DuckDuckGo only."
     )
     parser.add_argument("--input", required=True, help="Path to input CSV")
     parser.add_argument(
@@ -175,9 +183,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=["duckduckgo"],
+        choices=["duckduckgo", "brave"],
         default="duckduckgo",
-        help="Search provider (DuckDuckGo only for smoke testing)",
+        help="Search provider (default: DuckDuckGo; Brave uses BRAVE_SEARCH_API_KEY)",
     )
     parser.add_argument(
         "--fields",
@@ -219,19 +227,16 @@ def main() -> None:
         print(f"Error: Missing required columns: {', '.join(missing)}", file=sys.stderr)
         return 1
 
-    # Verify provider is free (no SerpAPI for smoke tests)
-    if args.provider != "duckduckgo":
-        print(
-            "Error: Smoke tests must use DuckDuckGo (free only, no paid API calls)",
-            file=sys.stderr,
-        )
-        return 1
+    brave_key = os.getenv(BRAVE_SEARCH_API_KEY_ENV)
 
-    print(f"Researching {args.rows} rows with DuckDuckGo...")
+    provider_label = "Brave Search API" if args.provider == "brave" else "DuckDuckGo"
+    print(f"Researching {args.rows} rows with {provider_label}...")
     print(f"Target fields: {', '.join(args.fields)}")
     print(f"Delay: {args.delay}s per request\n")
+    if args.provider == "brave" and not brave_key:
+        print("Warning: BRAVE_SEARCH_API_KEY missing; DuckDuckGo fallback will be used.")
 
-    # Run enrichment with free provider only
+    # Run enrichment. SerpAPI and Apollo are intentionally not passed/enabled here.
     result_df = enrich_dataframe(
         df,
         mode="preview",
@@ -240,7 +245,8 @@ def main() -> None:
         use_apollo=False,
         apollo_api_key=None,
         target_fields=args.fields,
-        search_provider="duckduckgo",
+        search_provider=args.provider,
+        brave_api_key=brave_key,
         serpapi_api_key=None,
         search_location="Galway, County Galway, Ireland",
     )
@@ -256,11 +262,13 @@ def main() -> None:
     counts = count_results(result_df)
 
     print("=" * 60)
-    print("SMOKE TEST RESULTS (DuckDuckGo Free Provider)")
+    print(f"SMOKE TEST RESULTS ({provider_label})")
     print("=" * 60)
     print(f"Verified Websites:       {counts['verified_websites']}")
     print(f"Website Candidates:      {counts['website_candidates']}")
     print(f"Rejected Directories:    {counts['rejected_directory_results']}")
+    print(f"API Errors:              {counts['api_errors']}")
+    print(f"Fallback Used:           {counts['fallback_used']}")
     print(f"DuckDuckGo Errors:       {counts['duckduckgo_errors']}")
     print(f"DuckDuckGo 403/Blocked:  {counts['duckduckgo_403']}")
     print(f"Verified Phones:         {counts['verified_phones']}")
@@ -287,7 +295,7 @@ def main() -> None:
     if counts["verified_websites"] > 0:
         print(f"[OK] Found {counts['verified_websites']} verified websites")
 
-    print("[OK] Used DuckDuckGo only (no paid API calls)")
+    print("[OK] Did not call SerpAPI, Google Places or Apollo")
     print("[OK] Smoke test completed successfully\n")
 
     return 0

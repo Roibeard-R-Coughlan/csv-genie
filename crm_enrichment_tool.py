@@ -39,8 +39,10 @@ except Exception:
 
 APOLLO_BASE_URL = "https://api.apollo.io/api/v1"
 APOLLO_API_KEY_ENV = "APOLLO_API_KEY"
+BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
 SERPAPI_API_KEY_ENV = "SERPAPI_API_KEY"
 DUCKDUCKGO_HTML_URL = "https://duckduckgo.com/html/?q={query}"
+BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
 DEFAULT_SEARCH_LOCATION = "Galway, County Galway, Ireland"
 
@@ -67,6 +69,7 @@ DIRECTORY_DOMAINS = {
     "whatclinic.com",
     "ratemds.com",
     "doctify.com",
+    "dentalby.com",
     "healthmail.ie",
     "solocheck.ie",
     "vision-net.ie",
@@ -170,6 +173,7 @@ class SearchResult:
     title: str
     url: str
     snippet: str = ""
+    provider_note: str = ""
 
 
 @dataclass
@@ -493,6 +497,86 @@ def is_duckduckgo_blocked(message: str) -> bool:
     return "duckduckgo blocked" in text or "403" in text or "429" in text or "rate-limit" in text
 
 
+def brave_search(
+    query: str,
+    max_results: int = 5,
+    api_key: Optional[str] = None,
+) -> List[SearchResult]:
+    """Search Brave Web Search API for candidate URLs only."""
+    key = api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV)
+    if not key:
+        return [SearchResult(title="SEARCH_ERROR", url="", snippet="BRAVE_SEARCH_API_KEY missing")]
+
+    headers = {
+        "x-subscription-token": key,
+        "accept": "application/json",
+        "x-loc-city": "Galway",
+        "x-loc-state-name": "County Galway",
+        "x-loc-country": "IE",
+        "x-loc-timezone": "Europe/Dublin",
+    }
+    params = {
+        "q": query,
+        "country": "IE",
+        "search_lang": "en",
+        "ui_lang": "en-IE",
+        "count": min(max(int(max_results), 1), 5),
+        "safesearch": "moderate",
+        "result_filter": "web,locations",
+    }
+    provider_note = "Provider used = Brave Search API"
+    try:
+        response = requests.get(BRAVE_SEARCH_URL, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
+        if response.status_code == 422:
+            retry_params = dict(params)
+            retry_params.update({"country": "GB", "ui_lang": "en-GB"})
+            response = requests.get(BRAVE_SEARCH_URL, headers=headers, params=retry_params, timeout=DEFAULT_TIMEOUT)
+            provider_note = "Provider used = Brave Search API; retried with supported GB query localization"
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        error_detail = ""
+        if "response" in locals():
+            error_detail = f" {response.text[:240]}"
+        return [SearchResult(title="SEARCH_ERROR", url="", snippet=f"Brave Search API error: {exc}{error_detail}")]
+
+    results: List[SearchResult] = []
+    for item in (data.get("web") or {}).get("results") or []:
+        url = item.get("url") or ""
+        title = item.get("title") or ""
+        snippet = item.get("description") or item.get("snippet") or ""
+        if url:
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    snippet=str(snippet or ""),
+                    provider_note=provider_note,
+                )
+            )
+
+    locations = (data.get("locations") or {}).get("results") or []
+    for item in locations[: max(0, max_results - len(results))]:
+        url = item.get("url") or item.get("website") or ""
+        title = item.get("title") or item.get("name") or ""
+        snippet_parts = [
+            str(item.get(key_name, ""))
+            for key_name in ["description", "address", "postal_code", "phone"]
+            if item.get(key_name)
+        ]
+        if url:
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    snippet=" ".join(snippet_parts),
+                    provider_note=provider_note,
+                )
+            )
+
+    return results[:max_results]
+
+
 def serpapi_search(
     query: str,
     max_results: int = 8,
@@ -550,10 +634,23 @@ def search_web(
     max_results: int = 8,
     *,
     provider: str = "duckduckgo",
+    brave_api_key: Optional[str] = None,
     serpapi_api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> List[SearchResult]:
     provider = (provider or "duckduckgo").lower().strip()
+    if provider in {"brave", "brave_search", "brave_search_api"}:
+        results = brave_search(query, max_results=min(max_results, 5), api_key=brave_api_key)
+        if is_search_error(results):
+            fallback = ddg_search(query, max_results=max_results)
+            fallback_note = f"Brave Search API unavailable ({results[0].snippet[:80]}). DuckDuckGo fallback used."
+            if fallback:
+                fallback[0].provider_note = fallback_note
+                fallback[0].snippet = f"{fallback_note} {fallback[0].snippet}"
+            else:
+                return [SearchResult(title="SEARCH_ERROR", url="", snippet=fallback_note, provider_note=fallback_note)]
+            return fallback
+        return results
     if provider in {"serpapi", "google", "google_serpapi"}:
         results = serpapi_search(query, max_results=max_results, api_key=serpapi_api_key, search_location=search_location)
         # If the paid provider is unavailable, fall back to the free provider instead of failing the row.
@@ -1060,6 +1157,7 @@ def enrich_row(
     delay: float = 0.0,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
     search_provider: str = "duckduckgo",
+    brave_api_key: Optional[str] = None,
     serpapi_api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> RowProposal:
@@ -1074,6 +1172,7 @@ def enrich_row(
 
     targets = {field.lower() for field in target_fields}
     existing_website = clean_cell(row.get("Website"))
+    selected_provider = (search_provider or "duckduckgo").lower().strip()
 
     # Optional Apollo lookup. Disabled unless explicitly enabled and key exists.
     if use_apollo and apollo_api_key:
@@ -1164,15 +1263,35 @@ def enrich_row(
     rescue_names: List[str] = []
     needs_contact_search = ("phone" in targets and not has_value(row.get("Phone"))) or ("email" in targets and not has_value(row.get("Email")))
     needs_website_search = "website" in targets and not existing_website and not proposal.website.value
+    search_provider_to_use = search_provider
     if needs_website_search or needs_contact_search:
         duckduckgo_blocked = False
+        provider_notes_seen: set[str] = set()
+        if selected_provider in {"brave", "brave_search", "brave_search_api"}:
+            if brave_api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV):
+                proposal.notes.append("Provider used = Brave Search API")
+                provider_notes_seen.add("Provider used = Brave Search API")
+            else:
+                proposal.notes.append("Brave Search API warning: BRAVE_SEARCH_API_KEY missing. DuckDuckGo fallback used.")
+                search_provider_to_use = "duckduckgo"
         for query in build_queries(company_name, area, category):
             if duckduckgo_blocked:
                 proposal.notes.append("DuckDuckGo skipped remaining queries after block/rate-limit response")
                 break
             if delay:
                 time.sleep(delay)
-            results = search_web(query, max_results=6, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
+            results = search_web(
+                query,
+                max_results=6,
+                provider=search_provider_to_use,
+                brave_api_key=brave_api_key,
+                serpapi_api_key=serpapi_api_key,
+                search_location=search_location,
+            )
+            for provider_note in [result.provider_note for result in results if result.provider_note]:
+                if provider_note not in provider_notes_seen:
+                    provider_notes_seen.add(provider_note)
+                    proposal.notes.append(provider_note)
             if is_search_error(results):
                 error_msg = results[0].snippet[:120]
                 if is_duckduckgo_blocked(error_msg):
@@ -1253,7 +1372,17 @@ def enrich_row(
                 proposal.website.update_if_better(official_url or source_url, official_url or source_url, min(verified_confidence, 0.90), f"Rescue verified: {verified_reason}")
 
         rescue_query = f'"{rescue_name}" "{area}" official website contact'
-        rescue_results = search_web(rescue_query, max_results=5, provider=search_provider, serpapi_api_key=serpapi_api_key, search_location=search_location)
+        rescue_results = search_web(
+            rescue_query,
+            max_results=5,
+            provider=search_provider_to_use,
+            brave_api_key=brave_api_key,
+            serpapi_api_key=serpapi_api_key,
+            search_location=search_location,
+        )
+        for provider_note in [result.provider_note for result in rescue_results if result.provider_note]:
+            if provider_note not in proposal.notes:
+                proposal.notes.append(provider_note)
         if is_search_error(rescue_results):
             error_msg = rescue_results[0].snippet[:120]
             if is_duckduckgo_blocked(error_msg):
@@ -1457,6 +1586,7 @@ def enrich_dataframe(
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     search_provider: str = "duckduckgo",
+    brave_api_key: Optional[str] = None,
     serpapi_api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> pd.DataFrame:
@@ -1503,6 +1633,7 @@ def enrich_dataframe(
                 delay=delay,
                 target_fields=target_fields,
                 search_provider=search_provider,
+                brave_api_key=brave_api_key,
                 serpapi_api_key=serpapi_api_key,
                 search_location=search_location,
             )
@@ -1552,6 +1683,7 @@ def enrich_csv(
     apollo_api_key: Optional[str] = None,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
     search_provider: str = "duckduckgo",
+    brave_api_key: Optional[str] = None,
     serpapi_api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> None:
@@ -1567,6 +1699,7 @@ def enrich_csv(
         apollo_api_key=api_key,
         target_fields=target_fields,
         search_provider=search_provider,
+        brave_api_key=brave_api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV),
         serpapi_api_key=serpapi_api_key,
         search_location=search_location,
     )
@@ -1580,7 +1713,8 @@ def main() -> None:
     parser.add_argument("--output-file", required=True, help="Path to output CSV file")
     parser.add_argument("--delay", type=float, default=0.0, help="Optional delay between network requests in seconds")
     parser.add_argument("--limit", type=int, default=5, help="Only research the first N incomplete rows while preserving all rows")
-    parser.add_argument("--search-provider", choices=["duckduckgo", "serpapi"], default="duckduckgo", help="Search backend for web discovery")
+    parser.add_argument("--search-provider", choices=["duckduckgo", "brave", "serpapi"], default="duckduckgo", help="Search backend for web discovery")
+    parser.add_argument("--brave-key", default=None, help="Optional Brave Search API key; otherwise BRAVE_SEARCH_API_KEY env var is used")
     parser.add_argument("--serpapi-key", default=None, help="Optional SerpAPI key; otherwise SERPAPI_API_KEY env var is used")
     parser.add_argument("--search-location", default=DEFAULT_SEARCH_LOCATION, help="Location bias for SerpAPI/Google local results")
     parser.add_argument("--mode", choices=["preview", "verified_only"], default="preview", help="preview keeps fields unchanged; verified_only fills high-confidence blanks")
@@ -1598,6 +1732,7 @@ def main() -> None:
         min_confidence=args.min_confidence,
         target_fields=args.fields,
         search_provider=args.search_provider,
+        brave_api_key=args.brave_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV),
         serpapi_api_key=args.serpapi_key or os.getenv(SERPAPI_API_KEY_ENV),
         search_location=args.search_location,
     )

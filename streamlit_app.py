@@ -15,7 +15,9 @@ import streamlit as st
 
 from crm_enrichment_tool import (
     AUDIT_COLUMNS,
+    BRAVE_SEARCH_API_KEY_ENV,
     DEFAULT_SEARCH_LOCATION,
+    SERPAPI_API_KEY_ENV,
     audit_columns_only,
     crm_import_columns_only,
     enrich_dataframe,
@@ -103,21 +105,32 @@ with st.sidebar:
     search_provider_label = st.selectbox(
         "Web search backend",
         [
+            "Brave Search API - recommended",
             "DuckDuckGo - free",
             "SerpAPI Google results - optional paid",
         ],
         index=0,
-        help="DuckDuckGo is free and usually sufficient. SerpAPI provides Google results but costs credits.",
+        help="Brave is recommended when BRAVE_SEARCH_API_KEY is available. DuckDuckGo is the free fallback. SerpAPI is optional paid.",
     )
-    search_provider = "serpapi" if search_provider_label.startswith("SerpAPI") else "duckduckgo"
+    if search_provider_label.startswith("Brave"):
+        search_provider = "brave"
+    elif search_provider_label.startswith("SerpAPI"):
+        search_provider = "serpapi"
+    else:
+        search_provider = "duckduckgo"
+    brave_env_key_exists = bool(os.getenv(BRAVE_SEARCH_API_KEY_ENV))
+    if brave_env_key_exists:
+        st.caption("BRAVE_SEARCH_API_KEY found in environment/.env")
+    else:
+        st.warning("Brave Search API selected without BRAVE_SEARCH_API_KEY will fall back to DuckDuckGo.")
     serpapi_key_input = st.text_input(
         "SerpAPI key for this session only",
         type="password",
         value="",
         help="Optional. Leave blank to use SERPAPI_API_KEY from .env or environment variables.",
     )
-    st.warning("⚠️ SerpAPI is a paid API provider. Do not use for bulk testing unless you intend to spend credits.")
-    serpapi_env_key_exists = bool(os.getenv("SERPAPI_API_KEY"))
+    st.warning("SerpAPI is a paid API provider. Do not use for bulk testing unless you intend to spend credits.")
+    serpapi_env_key_exists = bool(os.getenv(SERPAPI_API_KEY_ENV))
     if serpapi_env_key_exists:
         st.caption("SERPAPI_API_KEY found in environment/.env")
     else:
@@ -167,7 +180,9 @@ def settings_changed(current: dict, previous: dict | None) -> bool:
 uploaded_file = st.file_uploader("Upload a CRM import CSV", type=["csv"])
 
 current_effective_search_provider = search_provider
-if search_provider == "serpapi" and not (serpapi_key_input.strip() or os.getenv("SERPAPI_API_KEY")):
+if search_provider == "brave" and not os.getenv(BRAVE_SEARCH_API_KEY_ENV):
+    current_effective_search_provider = "duckduckgo"
+elif search_provider == "serpapi" and not (serpapi_key_input.strip() or os.getenv(SERPAPI_API_KEY_ENV)):
     current_effective_search_provider = "duckduckgo"
 
 current_run_settings = build_run_settings(
@@ -183,7 +198,7 @@ current_run_settings = build_run_settings(
 
 st.info(
     "Recommended test: Preview only, 10 rows, 1.00s delay, Website first. "
-    "Use DuckDuckGo for free testing; SerpAPI for Google results (paid). Keep Search location bias set to Galway, County Galway, Ireland. Use the audit CSV for review."
+    "Use Brave Search API when available, with DuckDuckGo as the free fallback. Keep Search location bias set to Galway, County Galway, Ireland. Use the audit CSV for review."
 )
 st.caption(
     "If a 25-row run seems to stall, watch the progress line after clicking Run research. "
@@ -250,8 +265,12 @@ if uploaded_file is not None:
         st.stop()
 
     if st.button("Run research", type="primary"):
-        serpapi_key = serpapi_key_input.strip() or os.getenv("SERPAPI_API_KEY")
+        brave_key = os.getenv(BRAVE_SEARCH_API_KEY_ENV)
+        serpapi_key = serpapi_key_input.strip() or os.getenv(SERPAPI_API_KEY_ENV)
         effective_search_provider = search_provider
+        if search_provider == "brave" and not brave_key:
+            st.warning("Brave Search API is selected but BRAVE_SEARCH_API_KEY is missing. Falling back to DuckDuckGo for this run.")
+            effective_search_provider = "duckduckgo"
         if search_provider == "serpapi" and not serpapi_key:
             st.warning("SerpAPI is selected but no key is available. Falling back to DuckDuckGo for this run.")
             effective_search_provider = "duckduckgo"
@@ -279,6 +298,7 @@ if uploaded_file is not None:
                 target_fields=target_fields,
                 progress_callback=update_progress,
                 search_provider=effective_search_provider,
+                brave_api_key=brave_key,
                 serpapi_api_key=serpapi_key,
                 search_location=search_location,
             )
