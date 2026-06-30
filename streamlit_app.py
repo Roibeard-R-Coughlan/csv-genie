@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 
 import pandas as pd
 import streamlit as st
+from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 
 from crm_enrichment_tool import (
@@ -30,6 +31,7 @@ from crm_enrichment_tool import (
     crm_import_columns_only,
     enrich_dataframe,
     extract_irish_phones,
+    fetch_page,
     get_domain,
     is_directory_domain,
     root_url,
@@ -68,6 +70,10 @@ if "new_lead_download_signature" not in st.session_state:
     st.session_state.new_lead_download_signature = None
 if "new_lead_search_meta" not in st.session_state:
     st.session_state.new_lead_search_meta = None
+if "seen_new_leads_df" not in st.session_state:
+    st.session_state.seen_new_leads_df = pd.DataFrame(columns=NEW_LEAD_COLUMNS) if "NEW_LEAD_COLUMNS" in globals() else pd.DataFrame()
+if "new_lead_export_version" not in st.session_state:
+    st.session_state.new_lead_export_version = 0
 if "synced_workbook_bytes" not in st.session_state:
     st.session_state.synced_workbook_bytes = None
 if "synced_workbook_filename" not in st.session_state:
@@ -497,9 +503,19 @@ NEW_LEAD_COLUMNS = [
     "Phone",
     "Source URL",
     "Duplicate Status",
+    "Matched Existing Company",
+    "Matched Existing Website",
+    "Matched Existing Phone",
+    "Matched Source File",
+    "Matched Field",
+    "Duplicate Match Confidence",
+    "Duplicate Reason",
     "Confidence",
     "Review Notes",
 ]
+
+if st.session_state.seen_new_leads_df.empty and not list(st.session_state.seen_new_leads_df.columns):
+    st.session_state.seen_new_leads_df = pd.DataFrame(columns=NEW_LEAD_COLUMNS)
 
 NEW_LEAD_APPROVAL_COLUMNS = [
     "Approve Lead?",
@@ -614,6 +630,35 @@ NON_IRELAND_LOCATION_TERMS = {
     "usa",
 }
 
+BUSINESS_DOMAIN_WORDS = [
+    "forster",
+    "court",
+    "eyre",
+    "square",
+    "galway",
+    "quay",
+    "gate",
+    "cuddy",
+    "king",
+    "niall",
+    "cronin",
+    "rdent",
+    "dental",
+    "dentists",
+    "dentist",
+    "clinic",
+    "group",
+    "physio",
+    "physiotherapy",
+    "accountants",
+    "accountant",
+    "solicitors",
+    "law",
+    "fitness",
+    "gym",
+    "studio",
+]
+
 GENERIC_RESULT_NAMES = {
     "dentist",
     "dentists",
@@ -621,6 +666,13 @@ GENERIC_RESULT_NAMES = {
     "our clinic",
     "group",
     "list of dentists in county",
+    "dentist galway",
+    "dentist in galway",
+    "trusted dentist in galway",
+    "your trusted dentist in galway",
+    "specialist dental practice in galway city",
+    "patient testimonials",
+    "your smile deserves a dentist who truly cares",
 }
 
 
@@ -646,6 +698,11 @@ def normalize_lead_phone(value: object) -> str:
     if digits.startswith("353"):
         digits = "0" + digits[3:]
     return digits
+
+
+def display_phone(value: object) -> str:
+    phone = normalize_lead_phone(value)
+    return phone or nonblank_value(value)
 
 
 def first_present_value(row: pd.Series, columns: list[str]) -> str:
@@ -685,7 +742,17 @@ def normalize_lead_category(value: object) -> str:
     return aliases.get(text, text)
 
 
-def build_existing_lead_index(existing_dfs: list[pd.DataFrame]) -> dict[str, set[str]]:
+def normalize_existing_sources(existing_sources: list[object]) -> list[tuple[str, pd.DataFrame]]:
+    normalized = []
+    for source in existing_sources:
+        if isinstance(source, tuple) and len(source) == 2:
+            normalized.append((str(source[0]), source[1]))
+        else:
+            normalized.append(("uploaded CSV", source))
+    return normalized
+
+
+def build_existing_lead_index(existing_dfs: list[object]) -> dict[str, set[str]]:
     index = {
         "names": set(),
         "domains": set(),
@@ -698,13 +765,18 @@ def build_existing_lead_index(existing_dfs: list[pd.DataFrame]) -> dict[str, set
         "phone_category": set(),
         "records": [],
     }
-    for df in existing_dfs:
+    for source_file, df in normalize_existing_sources(existing_dfs):
         for _, row in df.iterrows():
-            name = normalize_lead_text(row.get("Company Name"))
-            area = normalize_lead_text(row.get("Area"))
-            domain = normalize_lead_domain(row.get("Website"))
-            phone = normalize_lead_phone(row.get("Phone"))
-            category = normalize_lead_category(first_present_value(row, CATEGORY_COLUMNS))
+            raw_name = nonblank_value(row.get("Company Name"))
+            raw_area = nonblank_value(row.get("Area"))
+            raw_website = nonblank_value(row.get("Website"))
+            raw_phone = nonblank_value(row.get("Phone"))
+            raw_category = first_present_value(row, CATEGORY_COLUMNS)
+            name = normalize_lead_text(raw_name)
+            area = normalize_lead_text(raw_area)
+            domain = normalize_lead_domain(raw_website)
+            phone = normalize_lead_phone(raw_phone)
+            category = normalize_lead_category(raw_category)
             if name:
                 index["names"].add(name)
             if area:
@@ -731,6 +803,10 @@ def build_existing_lead_index(existing_dfs: list[pd.DataFrame]) -> dict[str, set
                         "domain": domain,
                         "phone": phone,
                         "category": category,
+                        "company": raw_name,
+                        "website": raw_website,
+                        "phone_display": raw_phone,
+                        "source_file": source_file,
                     }
                 )
     return index
@@ -749,19 +825,114 @@ def infer_company_name_from_result(title: str, category: str, area: str) -> str:
     return cleaned or title.strip() or "Unknown business"
 
 
+def split_domain_label(label: str) -> list[str]:
+    remaining = normalize_lead_text(label).replace(" ", "")
+    if not remaining:
+        return []
+    words = []
+    while remaining:
+        match = ""
+        for word in sorted(BUSINESS_DOMAIN_WORDS, key=len, reverse=True):
+            if remaining.startswith(word):
+                match = word
+                break
+        if match:
+            words.append(match)
+            remaining = remaining[len(match) :]
+        else:
+            token = re.match(r"^[a-z0-9]+?(?=(?:" + "|".join(re.escape(w) for w in BUSINESS_DOMAIN_WORDS) + r")|$)", remaining)
+            chunk = token.group(0) if token else remaining
+            words.append(chunk)
+            remaining = remaining[len(chunk) :]
+    return [word for word in words if word]
+
+
 def company_name_from_domain(domain: str) -> str:
     label = (domain or "").split(".")[0]
-    label = re.sub(r"[^a-zA-Z0-9]+", " ", label)
-    words = [word for word in label.split() if word]
-    return " ".join(word.capitalize() for word in words) or "Unknown business"
+    words = split_domain_label(label)
+    return " ".join(word.upper() if word == "rdent" else word.capitalize() for word in words) or "Unknown business"
 
 
-def clean_new_lead_company_name(title: str, domain: str, category: str, area: str) -> str:
+def extract_page_name_signals(url: str) -> list[str]:
+    html, _final_url = fetch_page(url, timeout=4)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    signals = []
+    selectors = [
+        ("meta[property='og:site_name']", "content"),
+        ("meta[property='og:title']", "content"),
+        ("meta[name='twitter:title']", "content"),
+    ]
+    for selector, attr in selectors:
+        node = soup.select_one(selector)
+        value = nonblank_value(node.get(attr)) if node else ""
+        if value:
+            signals.append(value)
+    if soup.title and soup.title.string:
+        signals.append(soup.title.string)
+    h1 = soup.find("h1")
+    if h1:
+        signals.append(h1.get_text(" ", strip=True))
+    return signals
+
+
+def is_generic_company_name(name: str) -> bool:
+    normalized = normalize_lead_text(name)
+    if normalized in GENERIC_RESULT_NAMES:
+        return True
+    words = normalized.split()
+    if len(words) <= 1:
+        return True
+    generic_tokens = {
+        "a",
+        "who",
+        "your",
+        "dentist",
+        "dentists",
+        "dental",
+        "clinic",
+        "practice",
+        "trusted",
+        "specialist",
+        "galway",
+        "city",
+        "county",
+        "in",
+        "patient",
+        "testimonials",
+        "smile",
+        "deserves",
+        "truly",
+        "cares",
+    }
+    return bool(words) and set(words).issubset(generic_tokens)
+
+
+def clean_page_signal(value: str, category: str, area: str) -> str:
+    cleaned = infer_company_name_from_result(value, category, area)
+    for separator in [" - ", " | ", " – ", " — ", ":"]:
+        if separator in cleaned:
+            parts = [part.strip() for part in cleaned.split(separator) if part.strip()]
+            specific = [part for part in parts if not is_generic_company_name(part)]
+            if specific:
+                return specific[0]
+            return parts[0] if parts else cleaned
+    return cleaned
+
+
+def clean_new_lead_company_name(title: str, domain: str, category: str, area: str, url: str) -> tuple[str, bool, str]:
     inferred = infer_company_name_from_result(title, category, area)
-    normalized = normalize_lead_text(inferred)
-    if normalized in GENERIC_RESULT_NAMES or len(normalized) <= 3:
-        return company_name_from_domain(domain)
-    return inferred
+    for signal in extract_page_name_signals(url):
+        candidate = clean_page_signal(signal, category, area)
+        if candidate and not is_generic_company_name(candidate):
+            return candidate, True, "Extracted from page title/H1/meta"
+    domain_name = company_name_from_domain(domain)
+    if domain_name != "Unknown business":
+        return domain_name, not is_generic_company_name(domain_name), "Extracted from domain"
+    if inferred and not is_generic_company_name(inferred):
+        return inferred, True, "Extracted from Brave result title"
+    return inferred or domain_name, False, "Generic search title; verify business name manually."
 
 
 def lead_name_similarity(name: str, existing_name: str) -> float:
@@ -781,7 +952,33 @@ def has_non_ireland_location_signal(result_text: str) -> bool:
     return any(term in normalized for term in NON_IRELAND_LOCATION_TERMS)
 
 
-def duplicate_status_for_candidate(
+def empty_duplicate_evidence(status: str = "New lead candidate", reason: str = "") -> dict[str, str]:
+    return {
+        "Duplicate Status": status,
+        "Matched Existing Company": "",
+        "Matched Existing Website": "",
+        "Matched Existing Phone": "",
+        "Matched Source File": "",
+        "Matched Field": "",
+        "Duplicate Match Confidence": "",
+        "Duplicate Reason": reason,
+    }
+
+
+def duplicate_evidence_from_record(record: dict[str, str], status: str, field: str, confidence: str, reason: str) -> dict[str, str]:
+    return {
+        "Duplicate Status": status,
+        "Matched Existing Company": record.get("company", ""),
+        "Matched Existing Website": record.get("website", ""),
+        "Matched Existing Phone": record.get("phone_display", ""),
+        "Matched Source File": record.get("source_file", ""),
+        "Matched Field": field,
+        "Duplicate Match Confidence": confidence,
+        "Duplicate Reason": reason,
+    }
+
+
+def duplicate_evidence_for_candidate(
     *,
     company_name: str,
     category: str,
@@ -789,36 +986,36 @@ def duplicate_status_for_candidate(
     website: str,
     phone: str,
     existing_index: dict[str, set[str]],
-) -> str:
+) -> dict[str, str]:
     name_key = normalize_lead_text(company_name)
     area_key = normalize_lead_text(area)
     category_key = normalize_lead_category(category)
     domain_key = normalize_lead_domain(website)
     phone_key = normalize_lead_phone(phone)
 
-    if domain_key and domain_key in existing_index["domains"]:
-        return "Already exists"
-    if phone_key and phone_key in existing_index["phones"]:
-        return "Already exists"
-    if f"{name_key}|{area_key}" in existing_index["name_area"]:
-        return "Already exists"
-    if category_key:
-        if domain_key and f"{domain_key}|{category_key}" in existing_index["domain_category"]:
-            return "Already exists"
-        if phone_key and f"{phone_key}|{category_key}" in existing_index["phone_category"]:
-            return "Already exists"
-        if name_key and f"{name_key}|{category_key}" in existing_index["name_category"]:
-            return "Possible duplicate"
-    if name_key and name_key in existing_index["names"]:
-        return "Possible duplicate"
     for existing in existing_index["records"]:
+        if domain_key and domain_key == existing.get("domain"):
+            return duplicate_evidence_from_record(existing, "Already exists", "Website domain", "1.00", "Website domain matches existing duplicate index row")
+        if phone_key and phone_key == existing.get("phone"):
+            return duplicate_evidence_from_record(existing, "Already exists", "Phone", "1.00", "Phone number matches existing duplicate index row")
+        if name_key and area_key and name_key == existing.get("name") and area_key == existing.get("area"):
+            return duplicate_evidence_from_record(existing, "Already exists", "Company Name + Area", "1.00", "Company name and area match existing duplicate index row")
+        if category_key and name_key and name_key == existing.get("name") and category_key == existing.get("category"):
+            return duplicate_evidence_from_record(existing, "Possible duplicate", "Company Name + Category", "0.90", "Company name and category match existing duplicate index row")
         same_area = not area_key or not existing.get("area") or area_key == existing.get("area")
         same_category = not category_key or not existing.get("category") or category_key == existing.get("category")
-        if same_area and same_category and lead_name_similarity(name_key, existing.get("name", "")) >= 0.65:
-            return "Possible duplicate"
+        similarity = lead_name_similarity(name_key, existing.get("name", ""))
+        if same_area and same_category and similarity >= 0.65:
+            return duplicate_evidence_from_record(
+                existing,
+                "Possible duplicate",
+                "Company Name",
+                f"{similarity:.2f}",
+                "Similar company name with compatible area/category",
+            )
     if not website and not phone:
-        return "Needs manual review"
-    return "New lead candidate"
+        return empty_duplicate_evidence("Needs manual review", "No website or phone found")
+    return empty_duplicate_evidence()
 
 
 def new_lead_queries_for_category(category: str, area: str) -> list[str]:
@@ -849,13 +1046,14 @@ def build_new_lead_candidates(
     seen_sources = set()
     seen_name_domains = set()
     api_errors = []
+    new_lead_count = 0
 
     for query in queries:
-        if len(rows) >= target_count:
+        if new_lead_count >= target_count:
             break
         results = brave_search(
             query,
-            max_results=min(20, max(target_count * 2, 10)),
+            max_results=20,
             api_key=brave_api_key,
             include_locations=False,
         )
@@ -863,7 +1061,7 @@ def build_new_lead_candidates(
             api_errors.append(results[0].snippet or "Brave Search error")
             continue
         for result in results:
-            if len(rows) >= target_count:
+            if new_lead_count >= target_count:
                 break
             source_url = nonblank_value(result.url)
             if not source_url or source_url in seen_sources:
@@ -875,7 +1073,7 @@ def build_new_lead_candidates(
             if is_new_lead_reference_domain(domain) or has_non_ireland_location_signal(result_text):
                 continue
             blocked_source = is_directory_domain(domain)
-            company_name = clean_new_lead_company_name(result.title, domain, category, area)
+            company_name, name_confident, name_reason = clean_new_lead_company_name(result.title, domain, category, area, source_url)
             website = "" if blocked_source else root_url(source_url)
             phone_values = extract_irish_phones(" ".join([result.snippet, result.candidate_phone]))
             phone = phone_values[0] if phone_values else ""
@@ -884,7 +1082,7 @@ def build_new_lead_candidates(
                 continue
             seen_sources.add(source_url)
             seen_name_domains.add(dedupe_key)
-            duplicate_status = duplicate_status_for_candidate(
+            duplicate_evidence = duplicate_evidence_for_candidate(
                 company_name=company_name,
                 category=category,
                 area=area,
@@ -892,7 +1090,12 @@ def build_new_lead_candidates(
                 phone=phone,
                 existing_index=existing_index,
             )
+            duplicate_status = duplicate_evidence["Duplicate Status"]
+            if duplicate_status == "New lead candidate" and not name_confident:
+                duplicate_evidence = empty_duplicate_evidence("Needs manual review", name_reason)
+                duplicate_status = "Needs manual review"
             notes = []
+            notes.append(name_reason)
             if blocked_source:
                 notes.append("Directory/community source - manual reference only")
             if duplicate_status in {"Already exists", "Possible duplicate"}:
@@ -914,11 +1117,13 @@ def build_new_lead_candidates(
                     "Website": website,
                     "Phone": phone,
                     "Source URL": source_url,
-                    "Duplicate Status": duplicate_status,
+                    **duplicate_evidence,
                     "Confidence": confidence,
                     "Review Notes": "; ".join(notes),
                 }
             )
+            if duplicate_status == "New lead candidate":
+                new_lead_count += 1
 
     output = pd.DataFrame(rows, columns=NEW_LEAD_COLUMNS)
     output.attrs["api_errors"] = api_errors
@@ -948,11 +1153,40 @@ def build_new_lead_approval_table(candidates_df: pd.DataFrame) -> pd.DataFrame:
 def generate_approved_new_leads(approval_df: pd.DataFrame) -> pd.DataFrame:
     if approval_df.empty:
         return pd.DataFrame(columns=NEW_LEAD_COLUMNS)
-    approved = approval_df[approval_df["Approve Lead?"].fillna(False).astype(bool)].copy()
+    allowed_statuses = {"New lead candidate", "Needs manual review"}
+    approved = approval_df[
+        approval_df["Approve Lead?"].fillna(False).astype(bool)
+        & approval_df["Duplicate Status"].isin(allowed_statuses)
+    ].copy()
     for column in ["Approve Lead?", "Approval Note"]:
         if column in approved.columns:
             approved = approved.drop(columns=[column])
     return approved[[col for col in NEW_LEAD_COLUMNS if col in approved.columns]]
+
+
+def read_local_lead_library() -> list[tuple[str, pd.DataFrame]]:
+    lead_library_path = Path("lead-library")
+    if not lead_library_path.exists() or not lead_library_path.is_dir():
+        return []
+    sources = []
+    for csv_path in sorted(lead_library_path.glob("*.csv")):
+        try:
+            sources.append((str(csv_path), pd.read_csv(csv_path, dtype=str, keep_default_na=False)))
+        except Exception:
+            continue
+    return sources
+
+
+def append_seen_new_leads(approved_df: pd.DataFrame) -> None:
+    if approved_df.empty:
+        return
+    current = st.session_state.seen_new_leads_df
+    st.session_state.seen_new_leads_df = pd.concat([current, approved_df], ignore_index=True)
+
+
+def new_leads_approved_filename() -> str:
+    version = max(int(st.session_state.new_lead_export_version), 1)
+    return f"new_leads_approved_v0.{version}.csv"
 
 
 SYNC_FIELDS = ["Website", "Phone", "Email", "Research Status", "Manual Notes"]
@@ -1462,11 +1696,21 @@ with research_tab:
 
 
 with new_leads_tab:
+    st.info("To avoid repeat results, upload your latest approved CRM file and any previous new-lead exports as duplicate indexes.")
     existing_crm_uploads = st.file_uploader(
         "Upload existing CRM CSVs for duplicate check",
         type=["csv"],
         accept_multiple_files=True,
         key="new_leads_existing_crm_csvs",
+    )
+    use_local_lead_library = st.checkbox(
+        "Also use local ignored lead-library/ folder as duplicate index",
+        value=False,
+        help="Optional. Reads local CSVs from lead-library/ for duplicate checks only; files remain read-only and ignored by Git.",
+    )
+    show_only_new_leads = st.checkbox(
+        "Show only new non-duplicate leads",
+        value=True,
     )
     new_lead_col1, new_lead_col2, new_lead_col3 = st.columns([2, 2, 1])
     with new_lead_col1:
@@ -1474,21 +1718,27 @@ with new_leads_tab:
     with new_lead_col2:
         new_lead_area = st.text_input("Area", value="Galway", key="new_lead_area")
     with new_lead_col3:
-        new_lead_target_count = st.number_input("Target leads", min_value=1, max_value=100, value=10, step=1)
+        new_lead_target_count = st.number_input("Target new non-duplicate leads", min_value=1, max_value=100, value=10, step=1)
 
-    existing_dfs = []
+    existing_sources = []
     for existing_upload in existing_crm_uploads:
         try:
-            existing_dfs.append(pd.read_csv(existing_upload, dtype=str, keep_default_na=False))
+            existing_sources.append((existing_upload.name, pd.read_csv(existing_upload, dtype=str, keep_default_na=False)))
         except Exception as exc:
             st.warning(f"{existing_upload.name} could not be read: {type(exc).__name__}: {exc}")
-    duplicate_index = build_existing_lead_index(existing_dfs)
-    st.metric("Existing CRM rows indexed", sum(len(df) for df in existing_dfs))
+    if use_local_lead_library:
+        local_sources = read_local_lead_library()
+        existing_sources.extend(local_sources)
+        st.caption(f"Local lead-library CSVs indexed: {len(local_sources)}")
+    if not st.session_state.seen_new_leads_df.empty:
+        existing_sources.append(("Session approved new leads", st.session_state.seen_new_leads_df))
+    duplicate_index = build_existing_lead_index(existing_sources)
+    st.metric("Existing duplicate-index rows", sum(len(df) for _, df in existing_sources))
     new_lead_signature = new_lead_search_signature(
         category=new_lead_category,
         area=new_lead_area,
         target_count=int(new_lead_target_count),
-        existing_upload_names=[upload.name for upload in existing_crm_uploads],
+        existing_upload_names=[name for name, _df in existing_sources],
     )
     if (
         st.session_state.new_lead_search_meta
@@ -1528,6 +1778,9 @@ with new_leads_tab:
         search_meta = st.session_state.new_lead_search_meta or {}
         api_errors = search_meta.get("api_errors", [])
         status_counts = st.session_state.new_lead_candidates_df["Duplicate Status"].value_counts().to_dict()
+        visible_new_leads_df = st.session_state.new_lead_candidates_df
+        if show_only_new_leads:
+            visible_new_leads_df = visible_new_leads_df[visible_new_leads_df["Duplicate Status"] == "New lead candidate"]
         metric_cols = st.columns(4)
         metric_cols[0].metric("New lead candidates", int(status_counts.get("New lead candidate", 0)))
         metric_cols[1].metric("Possible duplicates", int(status_counts.get("Possible duplicate", 0)))
@@ -1538,9 +1791,9 @@ with new_leads_tab:
                 for error in api_errors:
                     st.write(error)
 
-        st.dataframe(st.session_state.new_lead_candidates_df, use_container_width=True)
+        st.dataframe(visible_new_leads_df, use_container_width=True)
         st.subheader("Approve new leads for export")
-        new_lead_approval_table = build_new_lead_approval_table(st.session_state.new_lead_candidates_df)
+        new_lead_approval_table = build_new_lead_approval_table(visible_new_leads_df)
         edited_new_lead_approval_df = st.data_editor(
             new_lead_approval_table,
             use_container_width=True,
@@ -1548,10 +1801,15 @@ with new_leads_tab:
             disabled=[
                 col
                 for col in new_lead_approval_table.columns
-                if col not in {"Approve Lead?", "Review Notes", "Approval Note"}
+                if col not in {"Approve Lead?", "Company Name", "Area", "Category", "Website", "Phone", "Review Notes", "Approval Note"}
             ],
             column_config={
                 "Approve Lead?": st.column_config.CheckboxColumn("Approve Lead?"),
+                "Company Name": st.column_config.TextColumn("Company Name"),
+                "Area": st.column_config.TextColumn("Area"),
+                "Category": st.column_config.TextColumn("Category"),
+                "Website": st.column_config.TextColumn("Website"),
+                "Phone": st.column_config.TextColumn("Phone"),
                 "Review Notes": st.column_config.TextColumn("Review Notes"),
                 "Approval Note": st.column_config.TextColumn("Approval Note"),
             },
@@ -1572,6 +1830,8 @@ with new_leads_tab:
         if st.button("Generate approved new leads CSV"):
             st.session_state.approved_new_leads_df = generate_approved_new_leads(edited_new_lead_approval_df)
             st.session_state.new_lead_download_signature = current_new_lead_download_signature
+            append_seen_new_leads(st.session_state.approved_new_leads_df)
+            st.session_state.new_lead_export_version += 1
             st.success(f"Approved new leads CSV generated with {len(st.session_state.approved_new_leads_df)} row(s).")
 
         if (
@@ -1581,7 +1841,7 @@ with new_leads_tab:
             st.download_button(
                 "Download approved new leads CSV",
                 data=st.session_state.approved_new_leads_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
-                file_name=versioned_filename("new_leads_approved.csv", "v0.1", ".csv"),
+                file_name=new_leads_approved_filename(),
                 mime="text/csv",
                 key="download_approved_new_leads_csv",
             )
