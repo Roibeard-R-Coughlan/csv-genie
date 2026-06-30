@@ -43,6 +43,7 @@ BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
 SERPAPI_API_KEY_ENV = "SERPAPI_API_KEY"
 DUCKDUCKGO_HTML_URL = "https://duckduckgo.com/html/?q={query}"
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_PLACE_SEARCH_URL = "https://api.search.brave.com/res/v1/local/pois/search"
 SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
 DEFAULT_SEARCH_LOCATION = "Galway, County Galway, Ireland"
 
@@ -174,6 +175,8 @@ class SearchResult:
     url: str
     snippet: str = ""
     provider_note: str = ""
+    candidate_phone: str = ""
+    candidate_email: str = ""
 
 
 @dataclass
@@ -499,8 +502,10 @@ def is_duckduckgo_blocked(message: str) -> bool:
 
 def brave_search(
     query: str,
-    max_results: int = 5,
+    max_results: int = 10,
     api_key: Optional[str] = None,
+    *,
+    include_place_search: bool = False,
 ) -> List[SearchResult]:
     """Search Brave Web Search API for candidate URLs only."""
     key = api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV)
@@ -514,24 +519,42 @@ def brave_search(
         "x-loc-state-name": "County Galway",
         "x-loc-country": "IE",
         "x-loc-timezone": "Europe/Dublin",
+        "x-loc-lat": "53.2707",
+        "x-loc-long": "-9.0568",
     }
+    requested_count = min(max(int(max_results), 1), 20)
     params = {
         "q": query,
         "country": "IE",
         "search_lang": "en",
         "ui_lang": "en-IE",
-        "count": min(max(int(max_results), 1), 5),
+        "count": requested_count,
         "safesearch": "moderate",
+        "spellcheck": "true",
+        "text_decorations": "false",
+        "extra_snippets": "true",
         "result_filter": "web,locations",
     }
-    provider_note = "Provider used = Brave Search API"
+
+    provider_notes = ["Provider used = Brave Web"]
     try:
         response = requests.get(BRAVE_SEARCH_URL, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
         if response.status_code == 422:
+            error_text = response.text.lower()
             retry_params = dict(params)
-            retry_params.update({"country": "GB", "ui_lang": "en-GB"})
+            if "result_filter" in error_text or "locations" in error_text:
+                retry_params["result_filter"] = "web"
+                response = requests.get(BRAVE_SEARCH_URL, headers=headers, params=retry_params, timeout=DEFAULT_TIMEOUT)
+                provider_notes.append("Brave Locations fallback used: result_filter=web after rejection")
+            else:
+                retry_params.update({"country": "GB", "ui_lang": "en-GB"})
+                response = requests.get(BRAVE_SEARCH_URL, headers=headers, params=retry_params, timeout=DEFAULT_TIMEOUT)
+                provider_notes.append("Brave localization fallback used: IE/en-IE rejected, retried GB/en-GB")
+        if response.status_code == 422:
+            retry_params = dict(params)
+            retry_params.update({"country": "GB", "ui_lang": "en-GB", "result_filter": "web"})
             response = requests.get(BRAVE_SEARCH_URL, headers=headers, params=retry_params, timeout=DEFAULT_TIMEOUT)
-            provider_note = "Provider used = Brave Search API; retried with supported GB query localization"
+            provider_notes.append("Brave Web fallback used: result_filter=web with GB/en-GB localization")
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
@@ -541,10 +564,17 @@ def brave_search(
         return [SearchResult(title="SEARCH_ERROR", url="", snippet=f"Brave Search API error: {exc}{error_detail}")]
 
     results: List[SearchResult] = []
+    provider_note = "; ".join(provider_notes)
     for item in (data.get("web") or {}).get("results") or []:
         url = item.get("url") or ""
         title = item.get("title") or ""
-        snippet = item.get("description") or item.get("snippet") or ""
+        snippet_parts = [item.get("description") or item.get("snippet") or ""]
+        extra_snippets = item.get("extra_snippets") or []
+        if isinstance(extra_snippets, list):
+            snippet_parts.extend(str(snippet) for snippet in extra_snippets if snippet)
+        elif extra_snippets:
+            snippet_parts.append(str(extra_snippets))
+        snippet = " ".join(part for part in snippet_parts if part)
         if url:
             results.append(
                 SearchResult(
@@ -556,13 +586,32 @@ def brave_search(
             )
 
     locations = (data.get("locations") or {}).get("results") or []
-    for item in locations[: max(0, max_results - len(results))]:
-        url = item.get("url") or item.get("website") or ""
+    for item in locations[: max(0, requested_count - len(results))]:
+        url = item.get("url") or item.get("website") or item.get("provider_url") or ""
         title = item.get("title") or item.get("name") or ""
+        postal_address = item.get("postal_address") or item.get("address") or ""
+        categories = item.get("categories") or []
+        if isinstance(categories, list):
+            categories_text = " ".join(str(category) for category in categories if category)
+        else:
+            categories_text = str(categories or "")
+        contact = item.get("contact") or {}
+        phone = ""
+        email = ""
+        if isinstance(contact, dict):
+            phone = str(contact.get("telephone") or contact.get("phone") or "")
+            email = str(contact.get("email") or "")
         snippet_parts = [
-            str(item.get(key_name, ""))
-            for key_name in ["description", "address", "postal_code", "phone"]
-            if item.get(key_name)
+            str(value)
+            for value in [
+                item.get("description"),
+                item.get("provider_url"),
+                postal_address,
+                categories_text,
+                phone,
+                email,
+            ]
+            if value
         ]
         if url:
             results.append(
@@ -570,10 +619,83 @@ def brave_search(
                     title=title,
                     url=url,
                     snippet=" ".join(snippet_parts),
-                    provider_note=provider_note,
+                    provider_note=f"{provider_note}; Provider used = Brave Locations",
+                    candidate_phone=phone,
+                    candidate_email=email,
                 )
             )
 
+    if include_place_search:
+        place_results = brave_place_search(query, max_results=max(0, requested_count - len(results)), api_key=key)
+        results.extend(place_results)
+
+    return results[:requested_count]
+
+
+def brave_place_search(query: str, max_results: int = 5, api_key: Optional[str] = None) -> List[SearchResult]:
+    """Optional Brave local POI search. Results remain candidate-only."""
+    if max_results <= 0:
+        return []
+    key = api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV)
+    if not key:
+        return []
+
+    headers = {
+        "x-subscription-token": key,
+        "accept": "application/json",
+        "x-loc-city": "Galway",
+        "x-loc-state-name": "County Galway",
+        "x-loc-country": "IE",
+        "x-loc-timezone": "Europe/Dublin",
+        "x-loc-lat": "53.2707",
+        "x-loc-long": "-9.0568",
+    }
+    params = {
+        "q": query,
+        "count": min(max(int(max_results), 1), 5),
+    }
+    try:
+        response = requests.get(BRAVE_PLACE_SEARCH_URL, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        return [
+            SearchResult(
+                title="SEARCH_ERROR",
+                url="",
+                snippet=f"Brave Place Search error: {type(exc).__name__}: {str(exc)[:160]}",
+                provider_note="Provider used = Brave Place Search; API error",
+            )
+        ]
+
+    results: List[SearchResult] = []
+    for item in data.get("results") or data.get("pois") or []:
+        url = item.get("url") or item.get("website") or item.get("provider_url") or ""
+        title = item.get("title") or item.get("name") or ""
+        postal_address = item.get("postal_address") or item.get("address") or ""
+        categories = item.get("categories") or []
+        if isinstance(categories, list):
+            categories_text = " ".join(str(category) for category in categories if category)
+        else:
+            categories_text = str(categories or "")
+        contact = item.get("contact") or {}
+        phone = ""
+        email = ""
+        if isinstance(contact, dict):
+            phone = str(contact.get("telephone") or contact.get("phone") or "")
+            email = str(contact.get("email") or "")
+        snippet = " ".join(str(value) for value in [postal_address, categories_text, phone, email] if value)
+        if url:
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    snippet=snippet,
+                    provider_note="Provider used = Brave Place Search",
+                    candidate_phone=phone,
+                    candidate_email=email,
+                )
+            )
     return results[:max_results]
 
 
@@ -640,7 +762,19 @@ def search_web(
 ) -> List[SearchResult]:
     provider = (provider or "duckduckgo").lower().strip()
     if provider in {"brave", "brave_search", "brave_search_api"}:
-        results = brave_search(query, max_results=min(max_results, 5), api_key=brave_api_key)
+        results = brave_search(query, max_results=max_results, api_key=brave_api_key)
+        if is_search_error(results):
+            fallback = ddg_search(query, max_results=max_results)
+            fallback_note = f"Brave Search API unavailable ({results[0].snippet[:80]}). DuckDuckGo fallback used."
+            if fallback:
+                fallback[0].provider_note = fallback_note
+                fallback[0].snippet = f"{fallback_note} {fallback[0].snippet}"
+            else:
+                return [SearchResult(title="SEARCH_ERROR", url="", snippet=fallback_note, provider_note=fallback_note)]
+            return fallback
+        return results
+    if provider in {"brave_places", "brave_search_places", "brave_search_plus_places"}:
+        results = brave_search(query, max_results=max_results, api_key=brave_api_key, include_place_search=True)
         if is_search_error(results):
             fallback = ddg_search(query, max_results=max_results)
             fallback_note = f"Brave Search API unavailable ({results[0].snippet[:80]}). DuckDuckGo fallback used."
@@ -1155,16 +1289,21 @@ def enrich_row(
     use_apollo: bool = False,
     apollo_api_key: Optional[str] = None,
     delay: float = 0.0,
+    search_api_delay: Optional[float] = None,
+    website_fetch_delay: Optional[float] = None,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
     search_provider: str = "duckduckgo",
     brave_api_key: Optional[str] = None,
     serpapi_api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
+    brave_result_count: int = 10,
 ) -> RowProposal:
     company_name = clean_cell(row.get("Company Name")) or ""
     area = clean_cell(row.get("Area")) or "Galway Ireland"
     category = clean_cell(row.get("Business Category")) or clean_cell(row.get("Website Category")) or ""
     proposal = RowProposal()
+    api_delay = float(delay if search_api_delay is None else search_api_delay)
+    fetch_delay = float(delay if website_fetch_delay is None else website_fetch_delay)
 
     if not company_name:
         proposal.notes.append("Skipped: missing company name")
@@ -1218,8 +1357,8 @@ def enrich_row(
     # engines do not return reliably, while still keeping values in audit review.
     if not existing_website and {"website", "phone", "email"} & targets:
         for guess_url in guessed_website_urls(company_name, category):
-            if delay:
-                time.sleep(delay)
+            if fetch_delay:
+                time.sleep(fetch_delay)
             html, final_url = fetch_page(guess_url, timeout=DIRECT_DOMAIN_TIMEOUT)
             if not html:
                 continue
@@ -1269,8 +1408,15 @@ def enrich_row(
         provider_notes_seen: set[str] = set()
         if selected_provider in {"brave", "brave_search", "brave_search_api"}:
             if brave_api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV):
-                proposal.notes.append("Provider used = Brave Search API")
-                provider_notes_seen.add("Provider used = Brave Search API")
+                proposal.notes.append("Provider used = Brave Web")
+                provider_notes_seen.add("Provider used = Brave Web")
+            else:
+                proposal.notes.append("Brave Search API warning: BRAVE_SEARCH_API_KEY missing. DuckDuckGo fallback used.")
+                search_provider_to_use = "duckduckgo"
+        elif selected_provider in {"brave_places", "brave_search_places", "brave_search_plus_places"}:
+            if brave_api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV):
+                proposal.notes.append("Provider used = Brave Web; Brave Place Search explicitly enabled")
+                provider_notes_seen.add("Provider used = Brave Web; Brave Place Search explicitly enabled")
             else:
                 proposal.notes.append("Brave Search API warning: BRAVE_SEARCH_API_KEY missing. DuckDuckGo fallback used.")
                 search_provider_to_use = "duckduckgo"
@@ -1278,11 +1424,11 @@ def enrich_row(
             if duckduckgo_blocked:
                 proposal.notes.append("DuckDuckGo skipped remaining queries after block/rate-limit response")
                 break
-            if delay:
-                time.sleep(delay)
+            if api_delay:
+                time.sleep(api_delay)
             results = search_web(
                 query,
-                max_results=6,
+                max_results=brave_result_count if search_provider_to_use in {"brave", "brave_search", "brave_search_api", "brave_places", "brave_search_places", "brave_search_plus_places"} else 6,
                 provider=search_provider_to_use,
                 brave_api_key=brave_api_key,
                 serpapi_api_key=serpapi_api_key,
@@ -1320,8 +1466,8 @@ def enrich_row(
 
                 # Only verify non-directory domains with high candidate confidence
                 if not is_directory_domain(result_domain) and candidate_confidence >= 0.65 and "website" in targets:
-                    if delay:
-                        time.sleep(delay / 2)
+                    if fetch_delay:
+                        time.sleep(fetch_delay)
                     html, _ = fetch_page(result.url)
                     if html:
                         page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
@@ -1338,6 +1484,14 @@ def enrich_row(
                     if phones:
                         snippet_conf = 0.65 if is_directory_domain(result_domain) else min(max(candidate_confidence, 0.65), 0.75)
                         proposal.add_candidate("Phone", phones[0], result.url, snippet_conf, "Phone from search result snippet - manual check only")
+                if "phone" in targets and result.candidate_phone:
+                    phones = extract_irish_phones(result.candidate_phone)
+                    if phones:
+                        proposal.add_candidate("Phone", phones[0], result.url, 0.66, "Phone from Brave location/place contact data - candidate only")
+                if "email" in targets and result.candidate_email:
+                    emails = extract_emails(result.candidate_email)
+                    if emails:
+                        proposal.add_candidate("Email", emails[0], result.url, 0.64, "Email from Brave location/place contact data - candidate only")
 
 
 
@@ -1345,8 +1499,8 @@ def enrich_row(
     # This handles rows where the CRM name is generic or slightly wrong, e.g.
     # "Ballinasloe Physiotherapy" appearing in directories as "Action Physio Ballinasloe".
     for rescue_name in rescue_names[:2]:
-        if delay:
-            time.sleep(delay)
+        if fetch_delay:
+            time.sleep(fetch_delay)
         for guess_url in guessed_website_urls(rescue_name, category)[:4]:
             html, final_url = fetch_page(guess_url, timeout=DIRECT_DOMAIN_TIMEOUT)
             if not html:
@@ -1374,7 +1528,7 @@ def enrich_row(
         rescue_query = f'"{rescue_name}" "{area}" official website contact'
         rescue_results = search_web(
             rescue_query,
-            max_results=5,
+            max_results=brave_result_count if search_provider_to_use in {"brave", "brave_search", "brave_search_api", "brave_places", "brave_search_places", "brave_search_plus_places"} else 5,
             provider=search_provider_to_use,
             brave_api_key=brave_api_key,
             serpapi_api_key=serpapi_api_key,
@@ -1401,8 +1555,8 @@ def enrich_row(
             # Strict verification for rescue search results
             result_domain = get_domain(result.url)
             if not is_directory_domain(result_domain) and "website" in targets:
-                if delay:
-                    time.sleep(delay / 2)
+                if fetch_delay:
+                    time.sleep(fetch_delay)
                 html, _ = fetch_page(result.url)
                 if html:
                     page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
@@ -1423,8 +1577,8 @@ def enrich_row(
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
-        if delay:
-            time.sleep(delay)
+        if fetch_delay:
+            time.sleep(fetch_delay)
         html, final_url = fetch_page(url)
         if not html:
             continue
@@ -1581,6 +1735,8 @@ def enrich_dataframe(
     min_confidence: float = 0.80,
     row_limit: Optional[int] = 5,
     delay: float = 0.0,
+    search_api_delay: Optional[float] = None,
+    website_fetch_delay: Optional[float] = None,
     use_apollo: bool = False,
     apollo_api_key: Optional[str] = None,
     target_fields: Iterable[str] = ("Website", "Phone", "Email"),
@@ -1589,6 +1745,7 @@ def enrich_dataframe(
     brave_api_key: Optional[str] = None,
     serpapi_api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
+    brave_result_count: int = 10,
 ) -> pd.DataFrame:
     """
     Enrich a dataframe and return original rows plus audit/proposal columns.
@@ -1631,11 +1788,14 @@ def enrich_dataframe(
                 use_apollo=use_apollo,
                 apollo_api_key=apollo_api_key,
                 delay=delay,
+                search_api_delay=search_api_delay,
+                website_fetch_delay=website_fetch_delay,
                 target_fields=target_fields,
                 search_provider=search_provider,
                 brave_api_key=brave_api_key,
                 serpapi_api_key=serpapi_api_key,
                 search_location=search_location,
+                brave_result_count=brave_result_count,
             )
         except Exception as exc:
             proposal = RowProposal()
@@ -1676,6 +1836,8 @@ def enrich_csv(
     output_file: str,
     *,
     delay: float = 0.0,
+    search_api_delay: Optional[float] = None,
+    website_fetch_delay: Optional[float] = None,
     max_rows: Optional[int] = 5,
     skip_apollo: bool = True,
     mode: str = "preview",
@@ -1686,6 +1848,7 @@ def enrich_csv(
     brave_api_key: Optional[str] = None,
     serpapi_api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
+    brave_result_count: int = 10,
 ) -> None:
     df = pd.read_csv(input_file, dtype=str, keep_default_na=False)
     api_key = apollo_api_key or os.getenv(APOLLO_API_KEY_ENV)
@@ -1695,6 +1858,8 @@ def enrich_csv(
         min_confidence=min_confidence,
         row_limit=max_rows,
         delay=delay,
+        search_api_delay=search_api_delay,
+        website_fetch_delay=website_fetch_delay,
         use_apollo=not skip_apollo,
         apollo_api_key=api_key,
         target_fields=target_fields,
@@ -1702,6 +1867,7 @@ def enrich_csv(
         brave_api_key=brave_api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV),
         serpapi_api_key=serpapi_api_key,
         search_location=search_location,
+        brave_result_count=brave_result_count,
     )
     enriched.to_csv(output_file, index=False)
     print(f"Enrichment completed. Output written to {output_file}")
@@ -1711,10 +1877,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Safely enrich CRM CSV files.")
     parser.add_argument("--input-file", required=True, help="Path to input CRM CSV file")
     parser.add_argument("--output-file", required=True, help="Path to output CSV file")
-    parser.add_argument("--delay", type=float, default=0.0, help="Optional delay between network requests in seconds")
+    parser.add_argument("--delay", type=float, default=0.0, help="Optional fallback delay between network requests in seconds")
+    parser.add_argument("--search-api-delay", type=float, default=None, help="Optional delay before search API requests in seconds")
+    parser.add_argument("--website-fetch-delay", type=float, default=None, help="Optional delay before website/contact-page requests in seconds")
     parser.add_argument("--limit", type=int, default=5, help="Only research the first N incomplete rows while preserving all rows")
-    parser.add_argument("--search-provider", choices=["duckduckgo", "brave", "serpapi"], default="duckduckgo", help="Search backend for web discovery")
+    parser.add_argument("--search-provider", choices=["duckduckgo", "brave", "brave_places", "serpapi"], default="duckduckgo", help="Search backend for web discovery")
     parser.add_argument("--brave-key", default=None, help="Optional Brave Search API key; otherwise BRAVE_SEARCH_API_KEY env var is used")
+    parser.add_argument("--brave-count", type=int, choices=[10, 20], default=10, help="Brave web result count")
     parser.add_argument("--serpapi-key", default=None, help="Optional SerpAPI key; otherwise SERPAPI_API_KEY env var is used")
     parser.add_argument("--search-location", default=DEFAULT_SEARCH_LOCATION, help="Location bias for SerpAPI/Google local results")
     parser.add_argument("--mode", choices=["preview", "verified_only"], default="preview", help="preview keeps fields unchanged; verified_only fills high-confidence blanks")
@@ -1726,6 +1895,8 @@ def main() -> None:
         args.input_file,
         args.output_file,
         delay=args.delay,
+        search_api_delay=args.search_api_delay,
+        website_fetch_delay=args.website_fetch_delay,
         max_rows=args.limit,
         skip_apollo=True,
         mode=args.mode,
@@ -1735,6 +1906,7 @@ def main() -> None:
         brave_api_key=args.brave_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV),
         serpapi_api_key=args.serpapi_key or os.getenv(SERPAPI_API_KEY_ENV),
         search_location=args.search_location,
+        brave_result_count=args.brave_count,
     )
 
 
