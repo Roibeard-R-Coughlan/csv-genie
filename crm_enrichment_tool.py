@@ -65,6 +65,8 @@ DIRECTORY_DOMAINS = {
     "twitter.com",
     "yelp.com",
     "goldenpages.ie",
+    "ireland-bd.com",
+    "irelands-advisor.com",
     "find-open.ie",
     "irelandlookup.com",
     "whatclinic.com",
@@ -122,7 +124,13 @@ DIRECTORY_DOMAINS = {
     "boards.ie",
     "reddit.com",
     "voicefleet.ai",
+    # Community/town portals can support manual research, but are not official
+    # clinic/business websites.
+    "athenryie.com",
+    "mountbellew.com",
 }
+
+DIRECTORY_COMMUNITY_REJECTED_REASON = "Directory/community site, not official business website"
 
 SUSPICIOUS_PHONE_REASONS = {
     "invalid_length": "Rejected phone candidate: invalid Irish phone length",
@@ -257,6 +265,14 @@ class RowProposal:
         key = field_name.lower().strip()
         matches = [candidate for candidate in self.candidates if candidate.field_name.lower() == key]
         return sorted(matches, key=lambda candidate: candidate.confidence, reverse=True)[:limit]
+
+    def top_official_candidates(self, field_name: str, limit: int = MAX_CANDIDATES_PER_FIELD) -> List[CandidateMatch]:
+        candidates = [
+            candidate
+            for candidate in self.top_candidates(field_name, limit=len(self.candidates) or MAX_CANDIDATES_PER_FIELD)
+            if not is_directory_domain(get_domain(candidate.value or candidate.source_url))
+        ]
+        return candidates[:limit]
 
 
 def clean_cell(value: Any) -> Optional[str]:
@@ -403,7 +419,7 @@ def is_official_phone_source(source_url: Optional[str], official_website: Option
 def is_probably_official_result(result: SearchResult, company_name: str, area: str) -> Tuple[bool, float, str]:
     domain = get_domain(result.url)
     if not domain or is_directory_domain(domain):
-        return False, 0.0, "directory/social/domain skipped"
+        return False, 0.0, DIRECTORY_COMMUNITY_REJECTED_REASON
 
     haystack = normalize_text(" ".join([result.title, result.snippet, domain, result.url]))
     tokens = company_tokens(company_name)
@@ -445,7 +461,7 @@ def score_candidate_search_result(result: SearchResult, company_name: str, area:
     confidence = 0.30 + (0.35 * token_ratio) + (0.10 if area_hit else 0.0) + (0.10 if domain_hit else 0.0)
     if directory:
         confidence = min(confidence, 0.55)
-        label = "Directory/social search result - manual checking only"
+        label = DIRECTORY_COMMUNITY_REJECTED_REASON
     else:
         confidence = min(confidence, 0.85)
         label = "Possible official website candidate"
@@ -705,11 +721,7 @@ def serpapi_search(
     api_key: Optional[str] = None,
     search_location: str = DEFAULT_SEARCH_LOCATION,
 ) -> List[SearchResult]:
-    """Search Google through SerpAPI when a key is available.
-
-    SerpAPI is better than scraped DuckDuckGo for exact local-business queries,
-    e.g. cases where Google finds the official site but DDG returns directories.
-    """
+    """Legacy SerpAPI helper retained for old imports; app routing keeps it disabled."""
     key = api_key or os.getenv(SERPAPI_API_KEY_ENV)
     if not key:
         return [SearchResult(title="SEARCH_ERROR", url="", snippet="SERPAPI_API_KEY missing")]
@@ -786,13 +798,11 @@ def search_web(
             return fallback
         return results
     if provider in {"serpapi", "google", "google_serpapi"}:
-        results = serpapi_search(query, max_results=max_results, api_key=serpapi_api_key, search_location=search_location)
-        # If the paid provider is unavailable, fall back to the free provider instead of failing the row.
-        if len(results) == 1 and results[0].title == "SEARCH_ERROR":
-            fallback = ddg_search(query, max_results=max_results)
-            if fallback:
-                fallback[0].snippet = f"SerpAPI unavailable ({results[0].snippet[:80]}). Fallback used. " + fallback[0].snippet
-            return fallback
+        results = ddg_search(query, max_results=max_results)
+        disabled_note = "SerpAPI disabled by CSV Genie safety settings. DuckDuckGo fallback used."
+        if results:
+            results[0].provider_note = disabled_note
+            results[0].snippet = f"{disabled_note} {results[0].snippet}"
         return results
     return ddg_search(query, max_results=max_results)
 
@@ -1044,11 +1054,11 @@ def verify_official_website(company_name: str, area: str, candidate_url: str, pa
 
     # Rule 1: Reject directory/forum/town/social/booking domains
     if is_directory_domain(domain):
-        return False, 0.0, "blocked directory domain", None
+        return False, 0.0, DIRECTORY_COMMUNITY_REJECTED_REASON, None
 
     # Reject town/general portal domains
     if domain in {"ballinasloe.ie", "galway.ie", "connemara.ie", "corrib.ie"}:
-        return False, 0.0, "town/general portal, not official business", None
+        return False, 0.0, DIRECTORY_COMMUNITY_REJECTED_REASON, None
 
     # Rule 5: Reject result pages like /privacy-policy, /directory/, /forum/, etc.
     url_lower = candidate_url.lower()
@@ -1443,8 +1453,6 @@ def enrich_row(
                 if is_duckduckgo_blocked(error_msg):
                     proposal.notes.append(f"DuckDuckGo blocked / 403: {error_msg}")
                     duckduckgo_blocked = True
-                elif "SERPAPI_API_KEY missing" in error_msg or "Quota" in error_msg or "Rate" in error_msg:
-                    proposal.notes.append(f"SerpAPI unavailable: {error_msg}. Fallback to DuckDuckGo.")
                 else:
                     proposal.notes.append(f"Search error: {error_msg}")
                 continue
@@ -1640,12 +1648,14 @@ def choose_decision_needed(row: pd.Series, proposal: RowProposal, targets: set[s
     if "duckduckgo blocked" in notes_text or "403" in notes_text or "rate-limit" in notes_text:
         return "DuckDuckGo blocked / 403"
 
-    best_website = proposal.top_candidates("Website", limit=1)
+    best_website = proposal.top_official_candidates("Website", limit=1)
     if best_website and best_website[0].confidence >= 0.65:
         return "Manual review: strong candidate but not verified"
     if best_website:
         return "Manual review: weak candidate only"
     if "website" in targets:
+        if proposal.top_candidates("Website", limit=1):
+            return "Manual search needed"
         return "No reliable candidate found"
     if proposal.candidates:
         return "Manual review: candidate found"
@@ -1685,7 +1695,7 @@ def apply_proposal_to_row(
     write_candidates("Website")
     write_candidates("Phone")
     write_candidates("Email")
-    best_website = proposal.top_candidates("Website", limit=1)
+    best_website = proposal.top_official_candidates("Website", limit=1)
     if best_website:
         output.at[idx, "Best Candidate Website"] = root_url(best_website[0].value)
         output.at[idx, "Best Candidate Confidence"] = f"{best_website[0].confidence:.2f}"
@@ -1881,11 +1891,11 @@ def main() -> None:
     parser.add_argument("--search-api-delay", type=float, default=None, help="Optional delay before search API requests in seconds")
     parser.add_argument("--website-fetch-delay", type=float, default=None, help="Optional delay before website/contact-page requests in seconds")
     parser.add_argument("--limit", type=int, default=5, help="Only research the first N incomplete rows while preserving all rows")
-    parser.add_argument("--search-provider", choices=["duckduckgo", "brave", "brave_places", "serpapi"], default="duckduckgo", help="Search backend for web discovery")
+    parser.add_argument("--search-provider", choices=["duckduckgo", "brave", "brave_places"], default="duckduckgo", help="Search backend for web discovery")
     parser.add_argument("--brave-key", default=None, help="Optional Brave Search API key; otherwise BRAVE_SEARCH_API_KEY env var is used")
     parser.add_argument("--brave-count", type=int, choices=[10, 20], default=10, help="Brave web result count")
-    parser.add_argument("--serpapi-key", default=None, help="Optional SerpAPI key; otherwise SERPAPI_API_KEY env var is used")
-    parser.add_argument("--search-location", default=DEFAULT_SEARCH_LOCATION, help="Location bias for SerpAPI/Google local results")
+    parser.add_argument("--serpapi-key", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--search-location", default=DEFAULT_SEARCH_LOCATION, help="Optional local search bias")
     parser.add_argument("--mode", choices=["preview", "verified_only"], default="preview", help="preview keeps fields unchanged; verified_only fills high-confidence blanks")
     parser.add_argument("--min-confidence", type=float, default=0.80, help="Minimum confidence required for verified_only fill")
     parser.add_argument("--fields", nargs="+", default=["Website", "Phone", "Email"], help="Fields to research, e.g. Website Phone Email")

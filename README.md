@@ -39,7 +39,7 @@ Smoke tests support Brave and DuckDuckGo only, never SerpAPI/Apollo, and save ti
 - Generic token matches (physio, clinic, galway, west) alone are rejected
 - Result pages (/privacy-policy/, /directory/, Reddit, forum posts) stay candidate-only
 - Added "Rejected Reason" column in audit output for every candidate
-- SerpAPI fallback improved with explicit error detection
+- SerpAPI routing is disabled; use Brave Search API or DuckDuckGo only.
 - Phone and email are always candidates; website requires proof of official identity
 
 **Safety guarantee:** No directory or unrelated business will be verified as an official website unless:
@@ -55,7 +55,7 @@ Examples of safe rejections:
 
 ## v4.4 changes
 
-- Added SerpAPI location bias so Google-style searches are centred on Galway/Ireland.
+- Search routing is centred on Brave Search API or DuckDuckGo only.
 - Added `phonebook.ie`, `page.tl`, `reviewbritain.com`, and `iscp.ie` to candidate-only handling.
 - Directory, booking, social and free-hosting pages are no longer treated as verified official websites.
 - Email proposals are verified only when found on an existing/proposed official website or contact page.
@@ -67,12 +67,10 @@ Put optional keys in `.env`:
 
 ```env
 BRAVE_SEARCH_API_KEY=your_brave_search_key_here
-SERPAPI_API_KEY=your_serpapi_key_here
 APOLLO_API_KEY=your_apollo_key_here
 ```
 
-Brave Search API is the recommended optional search provider. Apollo remains off by default. SerpAPI is optional paid search and should be used only when you intentionally want Google-style paid discovery.
-Do not use SerpAPI for automated smoke testing unless you explicitly intend to spend credits.
+Brave Search API is the recommended optional search provider. Apollo remains off by default. SerpAPI and Google Places are not used.
 
 ## Phone numbers and Excel
 

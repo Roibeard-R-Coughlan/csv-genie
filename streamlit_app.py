@@ -11,6 +11,7 @@ import csv
 from io import BytesIO
 import os
 from pathlib import Path
+import re
 from datetime import datetime
 import zipfile
 import xml.etree.ElementTree as ET
@@ -23,11 +24,14 @@ from crm_enrichment_tool import (
     AUDIT_COLUMNS,
     BRAVE_SEARCH_API_KEY_ENV,
     DEFAULT_SEARCH_LOCATION,
-    SERPAPI_API_KEY_ENV,
     audit_columns_only,
+    brave_search,
     clean_cell,
     crm_import_columns_only,
     enrich_dataframe,
+    extract_irish_phones,
+    get_domain,
+    is_directory_domain,
     root_url,
 )
 
@@ -37,7 +41,7 @@ st.set_page_config(page_title="CSV Genie", layout="wide")
 st.title("CSV Genie")
 st.caption("Verified CRM import enrichment with candidate review for missing websites, phone numbers and emails.")
 
-research_tab, sync_tab = st.tabs(["Research & Approval", "Sync Excel Workbook"])
+research_tab, new_leads_tab, sync_tab = st.tabs(["Research & Approval", "Find New Leads", "Sync Excel Workbook"])
 
 # Keep results alive after download clicks/reruns.
 if "result_df" not in st.session_state:
@@ -54,6 +58,10 @@ if "approved_import_df" not in st.session_state:
     st.session_state.approved_import_df = None
 if "approval_log_df" not in st.session_state:
     st.session_state.approval_log_df = None
+if "approved_download_signature" not in st.session_state:
+    st.session_state.approved_download_signature = None
+if "new_lead_candidates_df" not in st.session_state:
+    st.session_state.new_lead_candidates_df = None
 if "synced_workbook_bytes" not in st.session_state:
     st.session_state.synced_workbook_bytes = None
 if "synced_workbook_filename" not in st.session_state:
@@ -119,19 +127,13 @@ with st.sidebar:
         "Web search backend",
         [
             "Brave Search API - recommended",
-            "Brave Search + Places - optional paid test",
             "DuckDuckGo - free",
-            "SerpAPI Google results - optional paid",
         ],
         index=0,
-        help="Brave is recommended when BRAVE_SEARCH_API_KEY is available. DuckDuckGo is the free fallback. Places and SerpAPI may be separately billed.",
+        help="Brave is recommended when BRAVE_SEARCH_API_KEY is available. DuckDuckGo is the free fallback.",
     )
-    if search_provider_label.startswith("Brave Search + Places"):
-        search_provider = "brave_places"
-    elif search_provider_label.startswith("Brave"):
+    if search_provider_label.startswith("Brave"):
         search_provider = "brave"
-    elif search_provider_label.startswith("SerpAPI"):
-        search_provider = "serpapi"
     else:
         search_provider = "duckduckgo"
     brave_env_key_exists = bool(os.getenv(BRAVE_SEARCH_API_KEY_ENV))
@@ -146,25 +148,10 @@ with st.sidebar:
         help="Use 10 by default. Try 20 only when you want a wider candidate set.",
         disabled=not search_provider.startswith("brave"),
     )
-    if search_provider == "brave_places":
-        st.warning("Brave Place Search may be billed separately from Web Search. Use small row limits while testing.")
-    serpapi_key_input = st.text_input(
-        "SerpAPI key for this session only",
-        type="password",
-        value="",
-        help="Optional. Leave blank to use SERPAPI_API_KEY from .env or environment variables.",
-    )
-    st.warning("SerpAPI is a paid API provider. Do not use for bulk testing unless you intend to spend credits.")
-    serpapi_env_key_exists = bool(os.getenv(SERPAPI_API_KEY_ENV))
-    if serpapi_env_key_exists:
-        st.caption("SERPAPI_API_KEY found in environment/.env")
-    else:
-        st.caption("No SERPAPI_API_KEY found. SerpAPI will fall back to DuckDuckGo unless you paste a key above.")
-
     search_location = st.text_input(
         "Search location bias",
         value=DEFAULT_SEARCH_LOCATION,
-        help="Used by SerpAPI/Google. Keep this local, e.g. Galway, County Galway, Ireland, to reduce irrelevant directory results.",
+        help="Keep this local, e.g. Galway, County Galway, Ireland, to reduce irrelevant directory results.",
     )
 
     st.subheader("Delays")
@@ -224,13 +211,17 @@ def settings_changed(current: dict, previous: dict | None) -> bool:
     return current != previous
 
 
+def invalidate_generated_downloads() -> None:
+    st.session_state.approved_import_df = None
+    st.session_state.approval_log_df = None
+    st.session_state.approved_download_signature = None
+
+
 with research_tab:
     uploaded_file = st.file_uploader("Upload a CRM import CSV", type=["csv"])
 
 current_effective_search_provider = search_provider
 if search_provider.startswith("brave") and not os.getenv(BRAVE_SEARCH_API_KEY_ENV):
-    current_effective_search_provider = "duckduckgo"
-elif search_provider == "serpapi" and not (serpapi_key_input.strip() or os.getenv(SERPAPI_API_KEY_ENV)):
     current_effective_search_provider = "duckduckgo"
 
 current_run_settings = build_run_settings(
@@ -288,7 +279,17 @@ def build_visible_audit(audit_df: pd.DataFrame, *, review_rows_only: bool, candi
 def versioned_filename(original_name: str | None, suffix: str, extension: str) -> str:
     path = Path(original_name or "csv_genie_export")
     base = path.stem or "csv_genie_export"
+    if suffix == "approved_v0.1":
+        match = re.match(r"^(?P<base>.+)_approved_v(?P<major>\d+)\.(?P<minor>\d+)$", base, flags=re.IGNORECASE)
+        if match:
+            base = match.group("base")
+            suffix = f"approved_v{match.group('major')}.{int(match.group('minor')) + 1}"
     return f"{base}_{suffix}{extension}"
+
+
+def approval_download_signature(source_file_name: str | None, run_settings: dict | None, approval_df: pd.DataFrame) -> str:
+    comparable = approval_df.fillna("").astype(str).to_json(orient="split")
+    return f"{source_file_name or ''}|{run_settings or {}}|{comparable}"
 
 
 APPROVAL_REVIEW_COLUMNS = [
@@ -311,6 +312,11 @@ APPROVAL_REVIEW_COLUMNS = [
 
 def nonblank_value(value: object) -> str:
     return clean_cell(value) or ""
+
+
+def is_blocked_directory_url(url: object) -> bool:
+    value = nonblank_value(url)
+    return bool(value and is_directory_domain(get_domain(value)))
 
 
 def build_website_approval_table(audit_df: pd.DataFrame) -> pd.DataFrame:
@@ -338,6 +344,10 @@ def build_website_approval_table(audit_df: pd.DataFrame) -> pd.DataFrame:
         existing_website = nonblank_value(row.get("Website"))
         proposed_website = nonblank_value(row.get("Proposed Website"))
         best_candidate = nonblank_value(row.get("Best Candidate Website"))
+        if is_blocked_directory_url(proposed_website):
+            proposed_website = ""
+        if is_blocked_directory_url(best_candidate):
+            best_candidate = ""
         approved_default = proposed_website or best_candidate
         approve_default = bool(proposed_website and not existing_website)
         decision_needed = nonblank_value(row.get("Decision Needed"))
@@ -412,6 +422,18 @@ def generate_approved_outputs(original_df: pd.DataFrame, approval_df: pd.DataFra
         approved_website = nonblank_value(approval_row.get("Approved Website"))
         if not approved_website:
             continue
+        if is_blocked_directory_url(approved_website):
+            log_rows.append(
+                {
+                    "Company Name": nonblank_value(approval_row.get("Company Name")),
+                    "Approved Website": approved_website,
+                    "Approval Note": nonblank_value(approval_row.get("Approval Note")),
+                    "Source candidate/proposal used": "Rejected manual approval",
+                    "Timestamp": timestamp,
+                    "Applied": "No - directory/community site rejected",
+                }
+            )
+            continue
 
         approved_website = root_url(approved_website)
         original_has_website = bool(nonblank_value(approved_import_df.at[source_index, "Website"]))
@@ -440,6 +462,220 @@ def generate_approved_outputs(original_df: pd.DataFrame, approval_df: pd.DataFra
         )
 
     return approved_import_df, pd.DataFrame(log_rows)
+
+
+NEW_LEAD_CATEGORIES = [
+    "Gym/Studio",
+    "Physio",
+    "Dental",
+    "Legal",
+    "Accountants/Finance",
+    "Hair/Beauty",
+    "Accommodation",
+    "Estate Agency",
+    "Hospitality",
+    "Builder",
+    "Plumber",
+    "Electrician",
+    "Trades",
+    "Clinic/Health Other",
+    "Retail",
+    "Other SME",
+]
+
+NEW_LEAD_COLUMNS = [
+    "Company Name",
+    "Category",
+    "Area",
+    "Website",
+    "Phone",
+    "Source URL",
+    "Duplicate Status",
+    "Confidence",
+    "Review Notes",
+]
+
+
+def normalize_lead_text(value: object) -> str:
+    text = nonblank_value(value).casefold()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_lead_domain(value: object) -> str:
+    text = nonblank_value(value)
+    if not text:
+        return ""
+    if "://" not in text:
+        text = f"https://{text}"
+    return get_domain(text)
+
+
+def normalize_lead_phone(value: object) -> str:
+    digits = re.sub(r"\D+", "", nonblank_value(value))
+    if digits.startswith("00353"):
+        digits = "353" + digits[5:]
+    if digits.startswith("353"):
+        digits = "0" + digits[3:]
+    return digits
+
+
+def build_existing_lead_index(existing_dfs: list[pd.DataFrame]) -> dict[str, set[str]]:
+    index = {"names": set(), "domains": set(), "phones": set(), "areas": set(), "name_area": set()}
+    for df in existing_dfs:
+        for _, row in df.iterrows():
+            name = normalize_lead_text(row.get("Company Name"))
+            area = normalize_lead_text(row.get("Area"))
+            domain = normalize_lead_domain(row.get("Website"))
+            phone = normalize_lead_phone(row.get("Phone"))
+            if name:
+                index["names"].add(name)
+            if area:
+                index["areas"].add(area)
+            if name or area:
+                index["name_area"].add(f"{name}|{area}")
+            if domain:
+                index["domains"].add(domain)
+            if phone:
+                index["phones"].add(phone)
+    return index
+
+
+def infer_company_name_from_result(title: str, category: str, area: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", title or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -|")
+    for separator in [" | ", " - ", " – ", " — ", ":"]:
+        if separator in cleaned:
+            cleaned = cleaned.split(separator)[0].strip()
+    noise_terms = [
+        "official website",
+        category,
+        area,
+        "galway",
+        "ireland",
+    ]
+    for term in noise_terms:
+        if term:
+            cleaned = re.sub(re.escape(term), "", cleaned, flags=re.IGNORECASE).strip(" -|,")
+    return cleaned or title.strip() or "Unknown business"
+
+
+def lead_name_similarity(name: str, existing_name: str) -> float:
+    tokens = set(name.split())
+    existing_tokens = set(existing_name.split())
+    if not tokens or not existing_tokens:
+        return 0.0
+    return len(tokens & existing_tokens) / len(tokens | existing_tokens)
+
+
+def duplicate_status_for_candidate(
+    *,
+    company_name: str,
+    area: str,
+    website: str,
+    phone: str,
+    existing_index: dict[str, set[str]],
+) -> str:
+    name_key = normalize_lead_text(company_name)
+    area_key = normalize_lead_text(area)
+    domain_key = normalize_lead_domain(website)
+    phone_key = normalize_lead_phone(phone)
+
+    if domain_key and domain_key in existing_index["domains"]:
+        return "Already exists"
+    if phone_key and phone_key in existing_index["phones"]:
+        return "Already exists"
+    if f"{name_key}|{area_key}" in existing_index["name_area"]:
+        return "Already exists"
+    if name_key and name_key in existing_index["names"]:
+        return "Possible duplicate"
+    for existing_name in existing_index["names"]:
+        if lead_name_similarity(name_key, existing_name) >= 0.65:
+            return "Possible duplicate"
+    if not website and not phone:
+        return "Needs manual review"
+    return "New lead candidate"
+
+
+def build_new_lead_candidates(
+    *,
+    category: str,
+    area: str,
+    target_count: int,
+    existing_index: dict[str, set[str]],
+    brave_api_key: str | None,
+) -> pd.DataFrame:
+    if not brave_api_key:
+        raise ValueError("BRAVE_SEARCH_API_KEY is required for new lead discovery.")
+
+    query_category = "SME business" if category == "Other SME" else category
+    queries = [
+        f"{query_category} {area} official website contact",
+        f"{query_category} {area} business Ireland",
+    ]
+    rows = []
+    seen_sources = set()
+    seen_name_domains = set()
+
+    for query in queries:
+        if len(rows) >= target_count:
+            break
+        results = brave_search(query, max_results=min(20, max(target_count * 2, 10)), api_key=brave_api_key)
+        for result in results:
+            if len(rows) >= target_count:
+                break
+            source_url = nonblank_value(result.url)
+            if not source_url or source_url in seen_sources:
+                continue
+            if result.title == "SEARCH_ERROR":
+                continue
+            domain = get_domain(source_url)
+            blocked_source = is_directory_domain(domain)
+            company_name = infer_company_name_from_result(result.title, category, area)
+            website = "" if blocked_source else root_url(source_url)
+            phone_values = extract_irish_phones(" ".join([result.snippet, result.candidate_phone]))
+            phone = phone_values[0] if phone_values else ""
+            dedupe_key = f"{normalize_lead_text(company_name)}|{normalize_lead_domain(website) or domain}"
+            if dedupe_key in seen_name_domains:
+                continue
+            seen_sources.add(source_url)
+            seen_name_domains.add(dedupe_key)
+            duplicate_status = duplicate_status_for_candidate(
+                company_name=company_name,
+                area=area,
+                website=website,
+                phone=phone,
+                existing_index=existing_index,
+            )
+            notes = []
+            if blocked_source:
+                notes.append("Directory/community source - manual reference only")
+            if duplicate_status in {"Already exists", "Possible duplicate"}:
+                notes.append("Matched existing CRM duplicate-check index")
+            if not website:
+                notes.append("No official website candidate from source")
+            confidence = "Medium"
+            if duplicate_status == "Already exists" or blocked_source:
+                confidence = "Low"
+            elif website and phone:
+                confidence = "High"
+            elif duplicate_status == "Needs manual review":
+                confidence = "Low"
+            rows.append(
+                {
+                    "Company Name": company_name,
+                    "Category": category,
+                    "Area": area,
+                    "Website": website,
+                    "Phone": phone,
+                    "Source URL": source_url,
+                    "Duplicate Status": duplicate_status,
+                    "Confidence": confidence,
+                    "Review Notes": "; ".join(notes),
+                }
+            )
+
+    return pd.DataFrame(rows, columns=NEW_LEAD_COLUMNS)
 
 
 SYNC_FIELDS = ["Website", "Phone", "Email", "Research Status", "Manual Notes"]
@@ -731,13 +967,9 @@ with research_tab:
 
         if st.button("Run research", type="primary"):
             brave_key = os.getenv(BRAVE_SEARCH_API_KEY_ENV)
-            serpapi_key = serpapi_key_input.strip() or os.getenv(SERPAPI_API_KEY_ENV)
             effective_search_provider = search_provider
             if search_provider.startswith("brave") and not brave_key:
                 st.warning("Brave Search API is selected but BRAVE_SEARCH_API_KEY is missing. Falling back to DuckDuckGo for this run.")
-                effective_search_provider = "duckduckgo"
-            if search_provider == "serpapi" and not serpapi_key:
-                st.warning("SerpAPI is selected but no key is available. Falling back to DuckDuckGo for this run.")
                 effective_search_provider = "duckduckgo"
 
             progress_bar = st.progress(0, text="Starting research...")
@@ -765,7 +997,7 @@ with research_tab:
                     progress_callback=update_progress,
                     search_provider=effective_search_provider,
                     brave_api_key=brave_key,
-                    serpapi_api_key=serpapi_key,
+                    serpapi_api_key=None,
                     search_location=search_location,
                     brave_result_count=int(brave_result_count),
                 )
@@ -787,8 +1019,7 @@ with research_tab:
                 search_location=search_location,
                 brave_result_count=int(brave_result_count),
             )
-            st.session_state.approved_import_df = None
-            st.session_state.approval_log_df = None
+            invalidate_generated_downloads()
             st.session_state.synced_workbook_bytes = None
             st.session_state.synced_workbook_filename = None
             st.session_state.sync_log_df = None
@@ -803,6 +1034,8 @@ with research_tab:
                 st.json(st.session_state.last_run_settings)
 
         if is_stale_result:
+            if st.session_state.approved_import_df is not None:
+                invalidate_generated_downloads()
             st.warning(
                 "The table and downloads below are from a previous run. "
                 "Your current sidebar settings are different. Run research again before downloading/importing."
@@ -810,8 +1043,7 @@ with research_tab:
             if st.button("Clear old results"):
                 st.session_state.result_df = None
                 st.session_state.last_run_settings = None
-                st.session_state.approved_import_df = None
-                st.session_state.approval_log_df = None
+                invalidate_generated_downloads()
                 st.session_state.synced_workbook_bytes = None
                 st.session_state.synced_workbook_filename = None
                 st.session_state.sync_log_df = None
@@ -841,7 +1073,11 @@ with research_tab:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Verified website proposals", proposed_website_count)
         c2.metric("Strong website candidates", strong_candidate_count)
-        c3.metric("Website candidates", candidate_website_count)
+        c3.metric(
+            "Candidate URLs found",
+            candidate_website_count,
+            help="Candidate URLs are research results only. They are not written to the CRM unless verified or manually approved.",
+        )
         c4.metric("Phone candidates", candidate_phone_count)
 
         if visible_audit.empty:
@@ -871,6 +1107,16 @@ with research_tab:
                 },
                 key="website_approval_editor",
             )
+            current_approval_signature = approval_download_signature(
+                st.session_state.source_file_name,
+                st.session_state.last_run_settings,
+                edited_approval_df,
+            )
+            if (
+                st.session_state.approved_import_df is not None
+                and st.session_state.approved_download_signature != current_approval_signature
+            ):
+                invalidate_generated_downloads()
 
             if st.button("Generate approved CRM import CSV", disabled=is_stale_result or st.session_state.source_df is None):
                 approved_import_df, approval_log_df = generate_approved_outputs(
@@ -879,18 +1125,32 @@ with research_tab:
                 )
                 st.session_state.approved_import_df = approved_import_df
                 st.session_state.approval_log_df = approval_log_df
+                st.session_state.approved_download_signature = current_approval_signature
                 applied_count = 0 if approval_log_df.empty else int((approval_log_df["Applied"] == "Yes").sum())
                 st.success(f"Approved CRM import CSV generated. Websites applied to {applied_count} blank Website field(s).")
 
-            if st.session_state.approved_import_df is not None:
+            if (
+                st.session_state.approved_import_df is not None
+                and st.session_state.approved_download_signature == current_approval_signature
+            ):
                 st.download_button(
-                    "Download approved CRM import CSV",
+                    "Download approved CRM import CSV for CRM upload",
                     data=st.session_state.approved_import_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
                     file_name=versioned_filename(st.session_state.source_file_name, "approved_v0.1", ".csv"),
                     disabled=is_stale_result,
                     mime="text/csv",
                     key="download_approved_crm_csv",
                 )
+
+        with st.expander("Advanced downloads", expanded=False):
+            st.download_button(
+                "Download audit CSV for review - not for CRM import",
+                data=audit_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
+                file_name="csv_genie_audit.csv",
+                disabled=is_stale_result,
+                mime="text/csv",
+                key="download_audit_csv",
+            )
 
             if st.session_state.approval_log_df is not None:
                 st.download_button(
@@ -902,36 +1162,78 @@ with research_tab:
                     key="download_approval_log_csv",
                 )
 
-        st.subheader("Download")
-        st.download_button(
-            "Download audit CSV for review - not for CRM import",
-            data=audit_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
-            file_name="csv_genie_audit.csv",
-            disabled=is_stale_result,
-            mime="text/csv",
-            key="download_audit_csv",
-        )
+            if st.session_state.last_mode == "preview":
+                st.warning("Preview mode keeps CRM fields unchanged. The audit CSV is the useful file at this stage; the CRM import CSV is disabled to avoid importing unchanged data by mistake.")
+                st.download_button(
+                    "Download CRM import CSV - disabled in Preview mode",
+                    data=final_import_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
+                    file_name="csv_genie_crm_import_preview_unchanged.csv",
+                    mime="text/csv",
+                    disabled=True,
+                    key="download_crm_disabled",
+                )
+            else:
+                st.warning("Verified-only mode fills only blank fields that meet the confidence threshold. Still review the audit CSV before importing.")
+                st.download_button(
+                    "Download CRM import CSV for website import",
+                    data=final_import_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
+                    file_name="csv_genie_crm_import.csv",
+                    mime="text/csv",
+                    disabled=is_stale_result,
+                    key="download_crm_csv",
+                )
 
-        if st.session_state.last_mode == "preview":
-            st.warning("Preview mode keeps CRM fields unchanged. The audit CSV is the useful file at this stage; the CRM import CSV is disabled to avoid importing unchanged data by mistake.")
-            st.download_button(
-                "Download CRM import CSV - disabled in Preview mode",
-                data=final_import_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
-                file_name="csv_genie_crm_import_preview_unchanged.csv",
-                mime="text/csv",
-                disabled=True,
-                key="download_crm_disabled",
-            )
-        else:
-            st.warning("Verified-only mode fills only blank fields that meet the confidence threshold. Still review the audit CSV before importing.")
-            st.download_button(
-                "Download CRM import CSV for website import",
-                data=final_import_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
-                file_name="csv_genie_crm_import.csv",
-                mime="text/csv",
-                disabled=is_stale_result,
-                key="download_crm_csv",
-            )
+
+with new_leads_tab:
+    existing_crm_uploads = st.file_uploader(
+        "Upload existing CRM CSVs for duplicate check",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="new_leads_existing_crm_csvs",
+    )
+    new_lead_col1, new_lead_col2, new_lead_col3 = st.columns([2, 2, 1])
+    with new_lead_col1:
+        new_lead_category = st.selectbox("Category", NEW_LEAD_CATEGORIES, index=NEW_LEAD_CATEGORIES.index("Dental"))
+    with new_lead_col2:
+        new_lead_area = st.text_input("Area", value="Galway", key="new_lead_area")
+    with new_lead_col3:
+        new_lead_target_count = st.number_input("Target leads", min_value=1, max_value=100, value=10, step=1)
+
+    existing_dfs = []
+    for existing_upload in existing_crm_uploads:
+        try:
+            existing_dfs.append(pd.read_csv(existing_upload, dtype=str, keep_default_na=False))
+        except Exception as exc:
+            st.warning(f"{existing_upload.name} could not be read: {type(exc).__name__}: {exc}")
+    duplicate_index = build_existing_lead_index(existing_dfs)
+    st.metric("Existing CRM rows indexed", sum(len(df) for df in existing_dfs))
+
+    if st.button("Find new lead candidates", type="primary", disabled=not os.getenv(BRAVE_SEARCH_API_KEY_ENV)):
+        try:
+            with st.spinner("Searching Brave for candidate businesses..."):
+                st.session_state.new_lead_candidates_df = build_new_lead_candidates(
+                    category=new_lead_category,
+                    area=new_lead_area,
+                    target_count=int(new_lead_target_count),
+                    existing_index=duplicate_index,
+                    brave_api_key=os.getenv(BRAVE_SEARCH_API_KEY_ENV),
+                )
+            st.success(f"New Lead Candidates CSV ready with {len(st.session_state.new_lead_candidates_df)} candidate row(s).")
+        except Exception as exc:
+            st.error(f"New lead search failed: {type(exc).__name__}: {exc}")
+
+    if not os.getenv(BRAVE_SEARCH_API_KEY_ENV):
+        st.warning("BRAVE_SEARCH_API_KEY is required for Find New Leads.")
+
+    if st.session_state.new_lead_candidates_df is not None:
+        st.dataframe(st.session_state.new_lead_candidates_df, use_container_width=True)
+        st.download_button(
+            "Download New Lead Candidates CSV",
+            data=st.session_state.new_lead_candidates_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
+            file_name=versioned_filename("new_lead_candidates.csv", "v0.1", ".csv"),
+            mime="text/csv",
+            key="download_new_lead_candidates_csv",
+        )
 
 
 with sync_tab:
