@@ -9,3 +9,26 @@ test_outputs/
 test-inputs/*.csv
 
 *.log
+
+# Local/private lead libraries
+lead-library/
+leads/
+private-leads/
+
+# Local CRM/test data
+test-inputs/
+test_outputs/
+*.csv
+*.xlsx
+*.xlsm
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python/cache/virtual env
+__pycache__/
+*.py[cod]
+.venv/
+.uv-cache/

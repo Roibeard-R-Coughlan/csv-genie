@@ -522,6 +522,7 @@ def brave_search(
     api_key: Optional[str] = None,
     *,
     include_place_search: bool = False,
+    include_locations: bool = True,
 ) -> List[SearchResult]:
     """Search Brave Web Search API for candidate URLs only."""
     key = api_key or os.getenv(BRAVE_SEARCH_API_KEY_ENV)
@@ -549,7 +550,7 @@ def brave_search(
         "spellcheck": "true",
         "text_decorations": "false",
         "extra_snippets": "true",
-        "result_filter": "web,locations",
+        "result_filter": "web,locations" if include_locations else "web",
     }
 
     provider_notes = ["Provider used = Brave Web"]
@@ -601,7 +602,7 @@ def brave_search(
                 )
             )
 
-    locations = (data.get("locations") or {}).get("results") or []
+    locations = ((data.get("locations") or {}).get("results") or []) if include_locations else []
     for item in locations[: max(0, requested_count - len(results))]:
         url = item.get("url") or item.get("website") or item.get("provider_url") or ""
         title = item.get("title") or item.get("name") or ""

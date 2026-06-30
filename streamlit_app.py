@@ -62,6 +62,12 @@ if "approved_download_signature" not in st.session_state:
     st.session_state.approved_download_signature = None
 if "new_lead_candidates_df" not in st.session_state:
     st.session_state.new_lead_candidates_df = None
+if "approved_new_leads_df" not in st.session_state:
+    st.session_state.approved_new_leads_df = None
+if "new_lead_download_signature" not in st.session_state:
+    st.session_state.new_lead_download_signature = None
+if "new_lead_search_meta" not in st.session_state:
+    st.session_state.new_lead_search_meta = None
 if "synced_workbook_bytes" not in st.session_state:
     st.session_state.synced_workbook_bytes = None
 if "synced_workbook_filename" not in st.session_state:
@@ -495,6 +501,128 @@ NEW_LEAD_COLUMNS = [
     "Review Notes",
 ]
 
+NEW_LEAD_APPROVAL_COLUMNS = [
+    "Approve Lead?",
+    *NEW_LEAD_COLUMNS,
+    "Approval Note",
+]
+
+CATEGORY_COLUMNS = [
+    "Business Category",
+    "Website Category",
+    "Category",
+    "Lead Category",
+    "Industry",
+]
+
+CATEGORY_SEARCH_TEMPLATES = {
+    "Dental": [
+        "{area} dental clinic official website",
+        "{area} dentist practice contact",
+        "{area} orthodontist dental care official site",
+    ],
+    "Physio": [
+        "{area} physiotherapy clinic official website",
+        "{area} physio practice contact",
+        "{area} physical therapy clinic official site",
+    ],
+    "Accountants/Finance": [
+        "{area} accountants official website",
+        "{area} tax advisor bookkeeping firm contact",
+        "{area} financial advisor accounting practice official site",
+    ],
+    "Legal": [
+        "{area} solicitor official website",
+        "{area} law firm contact",
+        "{area} legal services official site",
+    ],
+    "Gym/Studio": [
+        "{area} gym studio official website",
+        "{area} fitness studio contact",
+        "{area} pilates yoga personal training official site",
+    ],
+    "Hair/Beauty": [
+        "{area} hair salon beauty salon official website",
+        "{area} barber nails beauty contact",
+        "{area} skincare salon official site",
+    ],
+    "Accommodation": [
+        "{area} guesthouse b&b accommodation official website",
+        "{area} hotel bed breakfast contact",
+        "{area} self catering accommodation official site",
+    ],
+    "Estate Agency": [
+        "{area} estate agent official website",
+        "{area} auctioneer property agent contact",
+        "{area} letting agent official site",
+    ],
+    "Hospitality": [
+        "{area} restaurant cafe bar official website",
+        "{area} takeaway hospitality business contact",
+        "{area} pub restaurant official site",
+    ],
+    "Builder": [
+        "{area} builder contractor official website",
+        "{area} construction company contact",
+        "{area} building contractor official site",
+    ],
+    "Plumber": [
+        "{area} plumber official website",
+        "{area} plumbing contractor contact",
+        "{area} emergency plumber official site",
+    ],
+    "Electrician": [
+        "{area} electrician official website",
+        "{area} electrical contractor contact",
+        "{area} registered electrician official site",
+    ],
+    "Trades": [
+        "{area} trades contractor official website",
+        "{area} local trades business contact",
+        "{area} repair maintenance contractor official site",
+    ],
+    "Clinic/Health Other": [
+        "{area} health clinic official website",
+        "{area} private clinic healthcare contact",
+        "{area} wellness clinic official site",
+    ],
+    "Retail": [
+        "{area} retail shop official website",
+        "{area} local store contact",
+        "{area} independent retailer official site",
+    ],
+    "Other SME": [
+        "{area} local business official website",
+        "{area} small business contact",
+        "{area} SME official site",
+    ],
+}
+
+NEW_LEAD_REFERENCE_DOMAINS = {
+    "gov.ie",
+    "citizensinformation.ie",
+    "hse.ie",
+    "wikipedia.org",
+}
+
+NON_IRELAND_LOCATION_TERMS = {
+    "newfoundland",
+    "canada",
+    "ontario",
+    "australia",
+    "united states",
+    "usa",
+}
+
+GENERIC_RESULT_NAMES = {
+    "dentist",
+    "dentists",
+    "clinic",
+    "our clinic",
+    "group",
+    "list of dentists in county",
+}
+
 
 def normalize_lead_text(value: object) -> str:
     text = nonblank_value(value).casefold()
@@ -520,24 +648,91 @@ def normalize_lead_phone(value: object) -> str:
     return digits
 
 
+def first_present_value(row: pd.Series, columns: list[str]) -> str:
+    for column in columns:
+        value = nonblank_value(row.get(column))
+        if value:
+            return value
+    return ""
+
+
+def normalize_lead_category(value: object) -> str:
+    text = normalize_lead_text(value)
+    aliases = {
+        "accountants finance": "accountants finance",
+        "accountant": "accountants finance",
+        "accountants": "accountants finance",
+        "finance": "accountants finance",
+        "solicitors": "legal",
+        "solicitor": "legal",
+        "law firm": "legal",
+        "gym studio": "gym studio",
+        "fitness": "gym studio",
+        "hair beauty": "hair beauty",
+        "bnb": "accommodation",
+        "b b": "accommodation",
+        "guesthouse": "accommodation",
+        "real estate": "estate agency",
+        "estate agents": "estate agency",
+        "restaurants": "hospitality",
+        "restaurant": "hospitality",
+        "pub": "hospitality",
+        "dental clinics": "dental",
+        "dentists": "dental",
+        "physiotherapy": "physio",
+        "clinic health other": "clinic health other",
+    }
+    return aliases.get(text, text)
+
+
 def build_existing_lead_index(existing_dfs: list[pd.DataFrame]) -> dict[str, set[str]]:
-    index = {"names": set(), "domains": set(), "phones": set(), "areas": set(), "name_area": set()}
+    index = {
+        "names": set(),
+        "domains": set(),
+        "phones": set(),
+        "areas": set(),
+        "categories": set(),
+        "name_area": set(),
+        "name_category": set(),
+        "domain_category": set(),
+        "phone_category": set(),
+        "records": [],
+    }
     for df in existing_dfs:
         for _, row in df.iterrows():
             name = normalize_lead_text(row.get("Company Name"))
             area = normalize_lead_text(row.get("Area"))
             domain = normalize_lead_domain(row.get("Website"))
             phone = normalize_lead_phone(row.get("Phone"))
+            category = normalize_lead_category(first_present_value(row, CATEGORY_COLUMNS))
             if name:
                 index["names"].add(name)
             if area:
                 index["areas"].add(area)
+            if category:
+                index["categories"].add(category)
             if name or area:
                 index["name_area"].add(f"{name}|{area}")
+            if name or category:
+                index["name_category"].add(f"{name}|{category}")
+            if domain or category:
+                index["domain_category"].add(f"{domain}|{category}")
+            if phone or category:
+                index["phone_category"].add(f"{phone}|{category}")
             if domain:
                 index["domains"].add(domain)
             if phone:
                 index["phones"].add(phone)
+            if name or domain or phone:
+                index["records"].append(
+                    {
+                        "name": name,
+                        "area": area,
+                        "domain": domain,
+                        "phone": phone,
+                        "category": category,
+                    }
+                )
     return index
 
 
@@ -547,17 +742,26 @@ def infer_company_name_from_result(title: str, category: str, area: str) -> str:
     for separator in [" | ", " - ", " – ", " — ", ":"]:
         if separator in cleaned:
             cleaned = cleaned.split(separator)[0].strip()
-    noise_terms = [
-        "official website",
-        category,
-        area,
-        "galway",
-        "ireland",
-    ]
+    noise_terms = ["official website", "official site", "contact us"]
     for term in noise_terms:
         if term:
             cleaned = re.sub(re.escape(term), "", cleaned, flags=re.IGNORECASE).strip(" -|,")
     return cleaned or title.strip() or "Unknown business"
+
+
+def company_name_from_domain(domain: str) -> str:
+    label = (domain or "").split(".")[0]
+    label = re.sub(r"[^a-zA-Z0-9]+", " ", label)
+    words = [word for word in label.split() if word]
+    return " ".join(word.capitalize() for word in words) or "Unknown business"
+
+
+def clean_new_lead_company_name(title: str, domain: str, category: str, area: str) -> str:
+    inferred = infer_company_name_from_result(title, category, area)
+    normalized = normalize_lead_text(inferred)
+    if normalized in GENERIC_RESULT_NAMES or len(normalized) <= 3:
+        return company_name_from_domain(domain)
+    return inferred
 
 
 def lead_name_similarity(name: str, existing_name: str) -> float:
@@ -568,9 +772,19 @@ def lead_name_similarity(name: str, existing_name: str) -> float:
     return len(tokens & existing_tokens) / len(tokens | existing_tokens)
 
 
+def is_new_lead_reference_domain(domain: str) -> bool:
+    return any(domain == blocked or domain.endswith("." + blocked) for blocked in NEW_LEAD_REFERENCE_DOMAINS)
+
+
+def has_non_ireland_location_signal(result_text: str) -> bool:
+    normalized = normalize_lead_text(result_text)
+    return any(term in normalized for term in NON_IRELAND_LOCATION_TERMS)
+
+
 def duplicate_status_for_candidate(
     *,
     company_name: str,
+    category: str,
     area: str,
     website: str,
     phone: str,
@@ -578,6 +792,7 @@ def duplicate_status_for_candidate(
 ) -> str:
     name_key = normalize_lead_text(company_name)
     area_key = normalize_lead_text(area)
+    category_key = normalize_lead_category(category)
     domain_key = normalize_lead_domain(website)
     phone_key = normalize_lead_phone(phone)
 
@@ -587,14 +802,35 @@ def duplicate_status_for_candidate(
         return "Already exists"
     if f"{name_key}|{area_key}" in existing_index["name_area"]:
         return "Already exists"
+    if category_key:
+        if domain_key and f"{domain_key}|{category_key}" in existing_index["domain_category"]:
+            return "Already exists"
+        if phone_key and f"{phone_key}|{category_key}" in existing_index["phone_category"]:
+            return "Already exists"
+        if name_key and f"{name_key}|{category_key}" in existing_index["name_category"]:
+            return "Possible duplicate"
     if name_key and name_key in existing_index["names"]:
         return "Possible duplicate"
-    for existing_name in existing_index["names"]:
-        if lead_name_similarity(name_key, existing_name) >= 0.65:
+    for existing in existing_index["records"]:
+        same_area = not area_key or not existing.get("area") or area_key == existing.get("area")
+        same_category = not category_key or not existing.get("category") or category_key == existing.get("category")
+        if same_area and same_category and lead_name_similarity(name_key, existing.get("name", "")) >= 0.65:
             return "Possible duplicate"
     if not website and not phone:
         return "Needs manual review"
     return "New lead candidate"
+
+
+def new_lead_queries_for_category(category: str, area: str) -> list[str]:
+    templates = CATEGORY_SEARCH_TEMPLATES.get(category, CATEGORY_SEARCH_TEMPLATES["Other SME"])
+    seen = set()
+    queries = []
+    for template in templates:
+        query = template.format(area=area).strip()
+        if query and query.casefold() not in seen:
+            seen.add(query.casefold())
+            queries.append(query)
+    return queries
 
 
 def build_new_lead_candidates(
@@ -608,19 +844,24 @@ def build_new_lead_candidates(
     if not brave_api_key:
         raise ValueError("BRAVE_SEARCH_API_KEY is required for new lead discovery.")
 
-    query_category = "SME business" if category == "Other SME" else category
-    queries = [
-        f"{query_category} {area} official website contact",
-        f"{query_category} {area} business Ireland",
-    ]
+    queries = new_lead_queries_for_category(category, area)
     rows = []
     seen_sources = set()
     seen_name_domains = set()
+    api_errors = []
 
     for query in queries:
         if len(rows) >= target_count:
             break
-        results = brave_search(query, max_results=min(20, max(target_count * 2, 10)), api_key=brave_api_key)
+        results = brave_search(
+            query,
+            max_results=min(20, max(target_count * 2, 10)),
+            api_key=brave_api_key,
+            include_locations=False,
+        )
+        if len(results) == 1 and results[0].title == "SEARCH_ERROR":
+            api_errors.append(results[0].snippet or "Brave Search error")
+            continue
         for result in results:
             if len(rows) >= target_count:
                 break
@@ -630,8 +871,11 @@ def build_new_lead_candidates(
             if result.title == "SEARCH_ERROR":
                 continue
             domain = get_domain(source_url)
+            result_text = " ".join([result.title, result.snippet, source_url])
+            if is_new_lead_reference_domain(domain) or has_non_ireland_location_signal(result_text):
+                continue
             blocked_source = is_directory_domain(domain)
-            company_name = infer_company_name_from_result(result.title, category, area)
+            company_name = clean_new_lead_company_name(result.title, domain, category, area)
             website = "" if blocked_source else root_url(source_url)
             phone_values = extract_irish_phones(" ".join([result.snippet, result.candidate_phone]))
             phone = phone_values[0] if phone_values else ""
@@ -642,6 +886,7 @@ def build_new_lead_candidates(
             seen_name_domains.add(dedupe_key)
             duplicate_status = duplicate_status_for_candidate(
                 company_name=company_name,
+                category=category,
                 area=area,
                 website=website,
                 phone=phone,
@@ -675,7 +920,39 @@ def build_new_lead_candidates(
                 }
             )
 
-    return pd.DataFrame(rows, columns=NEW_LEAD_COLUMNS)
+    output = pd.DataFrame(rows, columns=NEW_LEAD_COLUMNS)
+    output.attrs["api_errors"] = api_errors
+    output.attrs["queries"] = queries
+    return output
+
+
+def new_lead_search_signature(
+    *,
+    category: str,
+    area: str,
+    target_count: int,
+    existing_upload_names: list[str],
+) -> str:
+    return "|".join([category, area, str(int(target_count)), ",".join(sorted(existing_upload_names))])
+
+
+def build_new_lead_approval_table(candidates_df: pd.DataFrame) -> pd.DataFrame:
+    if candidates_df.empty:
+        return pd.DataFrame(columns=NEW_LEAD_APPROVAL_COLUMNS)
+    approval_df = candidates_df.copy()
+    approval_df.insert(0, "Approve Lead?", approval_df["Duplicate Status"].eq("New lead candidate"))
+    approval_df["Approval Note"] = ""
+    return approval_df[NEW_LEAD_APPROVAL_COLUMNS]
+
+
+def generate_approved_new_leads(approval_df: pd.DataFrame) -> pd.DataFrame:
+    if approval_df.empty:
+        return pd.DataFrame(columns=NEW_LEAD_COLUMNS)
+    approved = approval_df[approval_df["Approve Lead?"].fillna(False).astype(bool)].copy()
+    for column in ["Approve Lead?", "Approval Note"]:
+        if column in approved.columns:
+            approved = approved.drop(columns=[column])
+    return approved[[col for col in NEW_LEAD_COLUMNS if col in approved.columns]]
 
 
 SYNC_FIELDS = ["Website", "Phone", "Email", "Research Status", "Manual Notes"]
@@ -1207,17 +1484,39 @@ with new_leads_tab:
             st.warning(f"{existing_upload.name} could not be read: {type(exc).__name__}: {exc}")
     duplicate_index = build_existing_lead_index(existing_dfs)
     st.metric("Existing CRM rows indexed", sum(len(df) for df in existing_dfs))
+    new_lead_signature = new_lead_search_signature(
+        category=new_lead_category,
+        area=new_lead_area,
+        target_count=int(new_lead_target_count),
+        existing_upload_names=[upload.name for upload in existing_crm_uploads],
+    )
+    if (
+        st.session_state.new_lead_search_meta
+        and st.session_state.new_lead_search_meta.get("signature") != new_lead_signature
+    ):
+        st.session_state.new_lead_candidates_df = None
+        st.session_state.approved_new_leads_df = None
+        st.session_state.new_lead_download_signature = None
+        st.session_state.new_lead_search_meta = None
 
     if st.button("Find new lead candidates", type="primary", disabled=not os.getenv(BRAVE_SEARCH_API_KEY_ENV)):
         try:
             with st.spinner("Searching Brave for candidate businesses..."):
-                st.session_state.new_lead_candidates_df = build_new_lead_candidates(
+                candidates_df = build_new_lead_candidates(
                     category=new_lead_category,
                     area=new_lead_area,
                     target_count=int(new_lead_target_count),
                     existing_index=duplicate_index,
                     brave_api_key=os.getenv(BRAVE_SEARCH_API_KEY_ENV),
                 )
+                st.session_state.new_lead_candidates_df = candidates_df
+                st.session_state.approved_new_leads_df = None
+                st.session_state.new_lead_download_signature = None
+                st.session_state.new_lead_search_meta = {
+                    "signature": new_lead_signature,
+                    "api_errors": list(candidates_df.attrs.get("api_errors", [])),
+                    "queries": list(candidates_df.attrs.get("queries", [])),
+                }
             st.success(f"New Lead Candidates CSV ready with {len(st.session_state.new_lead_candidates_df)} candidate row(s).")
         except Exception as exc:
             st.error(f"New lead search failed: {type(exc).__name__}: {exc}")
@@ -1226,14 +1525,66 @@ with new_leads_tab:
         st.warning("BRAVE_SEARCH_API_KEY is required for Find New Leads.")
 
     if st.session_state.new_lead_candidates_df is not None:
+        search_meta = st.session_state.new_lead_search_meta or {}
+        api_errors = search_meta.get("api_errors", [])
+        status_counts = st.session_state.new_lead_candidates_df["Duplicate Status"].value_counts().to_dict()
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("New lead candidates", int(status_counts.get("New lead candidate", 0)))
+        metric_cols[1].metric("Possible duplicates", int(status_counts.get("Possible duplicate", 0)))
+        metric_cols[2].metric("Already exists", int(status_counts.get("Already exists", 0)))
+        metric_cols[3].metric("API errors", len(api_errors))
+        if api_errors:
+            with st.expander("New lead search API errors", expanded=False):
+                for error in api_errors:
+                    st.write(error)
+
         st.dataframe(st.session_state.new_lead_candidates_df, use_container_width=True)
-        st.download_button(
-            "Download New Lead Candidates CSV",
-            data=st.session_state.new_lead_candidates_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
-            file_name=versioned_filename("new_lead_candidates.csv", "v0.1", ".csv"),
-            mime="text/csv",
-            key="download_new_lead_candidates_csv",
+        st.subheader("Approve new leads for export")
+        new_lead_approval_table = build_new_lead_approval_table(st.session_state.new_lead_candidates_df)
+        edited_new_lead_approval_df = st.data_editor(
+            new_lead_approval_table,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[
+                col
+                for col in new_lead_approval_table.columns
+                if col not in {"Approve Lead?", "Review Notes", "Approval Note"}
+            ],
+            column_config={
+                "Approve Lead?": st.column_config.CheckboxColumn("Approve Lead?"),
+                "Review Notes": st.column_config.TextColumn("Review Notes"),
+                "Approval Note": st.column_config.TextColumn("Approval Note"),
+            },
+            key="new_lead_approval_editor",
         )
+        current_new_lead_download_signature = approval_download_signature(
+            "new_lead_candidates.csv",
+            search_meta,
+            edited_new_lead_approval_df,
+        )
+        if (
+            st.session_state.approved_new_leads_df is not None
+            and st.session_state.new_lead_download_signature != current_new_lead_download_signature
+        ):
+            st.session_state.approved_new_leads_df = None
+            st.session_state.new_lead_download_signature = None
+
+        if st.button("Generate approved new leads CSV"):
+            st.session_state.approved_new_leads_df = generate_approved_new_leads(edited_new_lead_approval_df)
+            st.session_state.new_lead_download_signature = current_new_lead_download_signature
+            st.success(f"Approved new leads CSV generated with {len(st.session_state.approved_new_leads_df)} row(s).")
+
+        if (
+            st.session_state.approved_new_leads_df is not None
+            and st.session_state.new_lead_download_signature == current_new_lead_download_signature
+        ):
+            st.download_button(
+                "Download approved new leads CSV",
+                data=st.session_state.approved_new_leads_df.to_csv(index=False, quoting=csv.QUOTE_ALL).encode("utf-8-sig"),
+                file_name=versioned_filename("new_leads_approved.csv", "v0.1", ".csv"),
+                mime="text/csv",
+                key="download_approved_new_leads_csv",
+            )
 
 
 with sync_tab:
